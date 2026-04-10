@@ -29,3 +29,14 @@ class PointRecord:
     z: float
     color: tuple[int, int, int]
 
+
+@dataclass(frozen=True)
+class WarningRecord:
+    code: str
+    message: str
+
+
+@dataclass(frozen=True)
+class MaterialFallbackRecord:
+    name: str
+    triangle_count: int

@@ -1,11 +1,14 @@
 import math
 import random
 
-from three_dgs_dataset_builder.core.models import DatasetSettingsSnapshot, PointRecord
+from three_dgs_dataset_builder.core.models import DatasetSettingsSnapshot, PointRecord, WarningRecord
 from three_dgs_dataset_builder.core.sampling import CLOSE_UP_BAND_FRACTION, generate_camera_samples
 from three_dgs_dataset_builder.core.serialization import (
+    append_warning_once,
+    build_materials_metadata,
     build_dummy_test_payload,
     build_frame_path,
+    build_metadata_payload,
     serialize_ply_ascii,
 )
 from three_dgs_dataset_builder.core.transforms import (
@@ -81,6 +84,112 @@ def test_build_dummy_test_payload_has_minimal_structure():
         "h": 512,
         "ply_file_path": "points3d.ply",
         "frames": [],
+    }
+
+
+def test_append_warning_once_deduplicates_by_key():
+    warnings = []
+    seen_keys = set()
+
+    appended_first = append_warning_once(
+        warnings,
+        seen_keys,
+        key="material_base_color_fallback:Mat_A",
+        code="material_base_color_fallback",
+        message="Material 'Mat_A' does not use a supported image texture chain; using base color fallback.",
+    )
+    appended_second = append_warning_once(
+        warnings,
+        seen_keys,
+        key="material_base_color_fallback:Mat_A",
+        code="material_base_color_fallback",
+        message="Material 'Mat_A' does not use a supported image texture chain; using base color fallback.",
+    )
+
+    assert appended_first is True
+    assert appended_second is False
+    assert warnings == [
+        WarningRecord(
+            code="material_base_color_fallback",
+            message="Material 'Mat_A' does not use a supported image texture chain; using base color fallback.",
+        )
+    ]
+
+
+def test_build_materials_metadata_summarizes_triangle_usage():
+    materials = build_materials_metadata(
+        fallback_triangle_count=184,
+        fallback_material_triangle_counts={
+            "Mat_B": 64,
+            "Mat_A": 120,
+        },
+    )
+
+    assert materials == {
+        "fallback_material_count": 2,
+        "fallback_triangle_count": 184,
+        "fallback_materials": [
+            {"name": "Mat_A", "triangle_count": 120},
+            {"name": "Mat_B", "triangle_count": 64},
+        ],
+    }
+
+
+def test_build_metadata_payload_contains_warning_and_material_sections():
+    payload = build_metadata_payload(
+        addon_version="0.3.0",
+        export_timestamp="2026-04-10T12:34:56Z",
+        dataset_name="example",
+        target_collection="Collection",
+        frame_count=100,
+        point_sample_count=50000,
+        image_width=1024,
+        image_height=1024,
+        render_engine="CYCLES",
+        warnings=[
+            WarningRecord(
+                code="material_base_color_fallback",
+                message="Material 'Mat_A' does not use a supported image texture chain; using base color fallback.",
+            ),
+            WarningRecord(
+                code="no_material",
+                message="Encountered mesh faces without an assigned material; using white fallback color.",
+            ),
+        ],
+        fallback_triangle_count=184,
+        fallback_material_triangle_counts={"Mat_A": 120, "Mat_B": 64},
+    )
+
+    assert payload == {
+        "addon_version": "0.3.0",
+        "export_timestamp": "2026-04-10T12:34:56Z",
+        "dataset_name": "example",
+        "target_collection": "Collection",
+        "frame_count": 100,
+        "point_sample_count": 50000,
+        "image_resolution": {"width": 1024, "height": 1024},
+        "render_engine": "CYCLES",
+        "warnings": [
+            {
+                "code": "material_base_color_fallback",
+                "message": (
+                    "Material 'Mat_A' does not use a supported image texture chain; "
+                    "using base color fallback."
+                ),
+            },
+            {
+                "code": "no_material",
+                "message": "Encountered mesh faces without an assigned material; using white fallback color.",
+            },
+        ],
+        "materials": {
+            "fallback_material_count": 2,
+            "fallback_triangle_count": 184,
+            "fallback_materials": [
+                {"name": "Mat_A", "triangle_count": 120},
+                {"name": "Mat_B", "triangle_count": 64},
+            ],
+        },
     }
 
 

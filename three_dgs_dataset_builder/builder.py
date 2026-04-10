@@ -5,14 +5,18 @@ import math
 import random
 from bisect import bisect_left
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import bpy
 from mathutils import Matrix, Vector
 
-from .core.models import CameraSample, DatasetSettingsSnapshot, PointRecord
+from . import bl_info
+from .core.models import CameraSample, DatasetSettingsSnapshot, PointRecord, WarningRecord
 from .core.sampling import generate_camera_samples
 from .core.serialization import (
+    append_warning_once,
+    build_metadata_payload,
     build_dummy_test_payload,
     build_frame_path,
     build_render_stem,
@@ -31,7 +35,9 @@ class BuildResult:
     output_dir: Path
     frame_count: int
     point_count: int
-    warnings: tuple[str, ...]
+    warnings: tuple[WarningRecord, ...]
+    fallback_material_count: int
+    fallback_triangle_count: int
 
 
 @dataclass(frozen=True)
@@ -48,7 +54,8 @@ class RenderState:
 class MaterialInfo:
     image: object | None
     base_color: tuple[int, int, int]
-    warning_key: str
+    material_name: str | None
+    fallback_code: str | None
 
 
 @dataclass(frozen=True)
@@ -67,6 +74,8 @@ class PointSamplingState:
     total_area: float
     sample_count: int
     rng: random.Random
+    fallback_triangle_count: int = 0
+    fallback_material_triangle_counts: dict[str, int] = field(default_factory=dict)
     points: list[PointRecord] = field(default_factory=list)
     sampled_count: int = 0
 
@@ -84,7 +93,8 @@ class BuildSession:
     camera_info: dict
     samples: list[CameraSample]
     frames: list[dict] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[WarningRecord] = field(default_factory=list)
+    warning_keys: set[str] = field(default_factory=set)
     point_state: PointSamplingState | None = None
 
 
@@ -176,6 +186,7 @@ def prepare_point_sampling(context, session: BuildSession) -> PointSamplingState
         context=context,
         collection=session.target_collection,
         warnings=session.warnings,
+        warning_keys=session.warning_keys,
         sample_count=session.snapshot.point_sample_count,
     )
     session.point_state = point_state
@@ -237,12 +248,34 @@ def write_outputs(session: BuildSession) -> BuildResult:
         serialize_ply_ascii(session.point_state.points),
         encoding="utf-8",
     )
+    (session.output_dir / "metadata.json").write_text(
+        json.dumps(
+            build_metadata_payload(
+                addon_version=_addon_version_string(),
+                export_timestamp=_export_timestamp_utc(),
+                dataset_name=session.snapshot.dataset_name,
+                target_collection=session.target_collection.name,
+                frame_count=len(session.frames),
+                point_sample_count=len(session.point_state.points),
+                image_width=int(session.camera_info["w"]),
+                image_height=int(session.camera_info["h"]),
+                render_engine=session.scene.render.engine,
+                warnings=session.warnings,
+                fallback_triangle_count=session.point_state.fallback_triangle_count,
+                fallback_material_triangle_counts=session.point_state.fallback_material_triangle_counts,
+            ),
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     return BuildResult(
         output_dir=session.output_dir,
         frame_count=len(session.frames),
         point_count=len(session.point_state.points),
         warnings=tuple(session.warnings),
+        fallback_material_count=len(session.point_state.fallback_material_triangle_counts),
+        fallback_triangle_count=session.point_state.fallback_triangle_count,
     )
 
 
@@ -363,12 +396,19 @@ def _matrix_to_rows(matrix: Matrix) -> list[list[float]]:
     return [[float(value) for value in row] for row in matrix]
 
 
-def _prepare_point_sampling_state(context, collection, warnings: list[str], sample_count: int) -> PointSamplingState:
+def _prepare_point_sampling_state(
+    context,
+    collection,
+    warnings: list[WarningRecord],
+    warning_keys: set[str],
+    sample_count: int,
+) -> PointSamplingState:
     depsgraph = context.evaluated_depsgraph_get()
     triangle_records: list[TriangleRecord] = []
     cumulative_areas: list[float] = []
     cumulative_area = 0.0
-    warned_keys: set[str] = set()
+    fallback_triangle_count = 0
+    fallback_material_triangle_counts: dict[str, int] = {}
 
     for obj in collection.all_objects:
         if obj.type != "MESH":
@@ -385,10 +425,7 @@ def _prepare_point_sampling_state(context, collection, warnings: list[str], samp
                 continue
 
             uv_layer = mesh.uv_layers.active.data if mesh.uv_layers.active else None
-            material_infos = [
-                _resolve_material_info(material, warned_keys, warnings)
-                for material in mesh.materials
-            ]
+            material_infos = [_resolve_material_info(material) for material in mesh.materials]
 
             for triangle in mesh.loop_triangles:
                 area = float(triangle.area)
@@ -401,6 +438,17 @@ def _prepare_point_sampling_state(context, collection, warnings: list[str], samp
                     if 0 <= material_index < len(material_infos)
                     else _fallback_material_info("missing_material")
                 )
+                if material_info.fallback_code is not None:
+                    fallback_triangle_count += 1
+                    if material_info.material_name is not None:
+                        fallback_material_triangle_counts[material_info.material_name] = (
+                            fallback_material_triangle_counts.get(material_info.material_name, 0) + 1
+                        )
+                    _append_warning_for_material_info(
+                        material_info,
+                        warnings,
+                        warning_keys,
+                    )
                 cumulative_area += area
                 triangle_records.append(
                     TriangleRecord(
@@ -428,6 +476,8 @@ def _prepare_point_sampling_state(context, collection, warnings: list[str], samp
         total_area=cumulative_areas[-1],
         sample_count=sample_count,
         rng=random.Random(),
+        fallback_triangle_count=fallback_triangle_count,
+        fallback_material_triangle_counts=fallback_material_triangle_counts,
     )
 
 
@@ -450,7 +500,7 @@ def _sample_triangle(vertices, uvs, rng: random.Random):
     return point, uv
 
 
-def _resolve_material_info(material, warned_keys: set[str], warnings: list[str]) -> MaterialInfo:
+def _resolve_material_info(material) -> MaterialInfo:
     if material is None:
         return _fallback_material_info("no_material")
 
@@ -470,22 +520,79 @@ def _resolve_material_info(material, warned_keys: set[str], warnings: list[str])
                     image = _find_linked_image(base_input.links[0].from_node, set())
 
     if image is None:
-        warning_key = f"material:{material.name}"
-        if warning_key not in warned_keys:
-            warnings.append(
-                f"Material '{material.name}' does not use a supported image texture chain; using base color fallback."
-            )
-            warned_keys.add(warning_key)
+        fallback_code = "material_base_color_fallback"
+    else:
+        fallback_code = None
 
     return MaterialInfo(
         image=image,
         base_color=_color_to_byte_tuple(base_color),
-        warning_key=f"material:{material.name}",
+        material_name=material.name,
+        fallback_code=fallback_code,
     )
 
 
 def _fallback_material_info(key: str) -> MaterialInfo:
-    return MaterialInfo(image=None, base_color=(255, 255, 255), warning_key=key)
+    return MaterialInfo(image=None, base_color=(255, 255, 255), material_name=None, fallback_code=key)
+
+
+def _append_warning(
+    warnings: list[WarningRecord],
+    warning_keys: set[str],
+    *,
+    key: str,
+    code: str,
+    message: str,
+) -> None:
+    append_warning_once(
+        warnings,
+        warning_keys,
+        key=key,
+        code=code,
+        message=message,
+    )
+
+
+def _append_warning_for_material_info(
+    material_info: MaterialInfo,
+    warnings: list[WarningRecord],
+    warning_keys: set[str],
+) -> None:
+    if material_info.fallback_code == "material_base_color_fallback" and material_info.material_name is not None:
+        _append_warning(
+            warnings,
+            warning_keys,
+            key=f"material_base_color_fallback:{material_info.material_name}",
+            code="material_base_color_fallback",
+            message=(
+                f"Material '{material_info.material_name}' does not use a supported image texture chain; "
+                "using base color fallback."
+            ),
+        )
+    elif material_info.fallback_code == "no_material":
+        _append_warning(
+            warnings,
+            warning_keys,
+            key="no_material",
+            code="no_material",
+            message="Encountered mesh faces without an assigned material; using white fallback color.",
+        )
+    elif material_info.fallback_code == "missing_material":
+        _append_warning(
+            warnings,
+            warning_keys,
+            key="missing_material",
+            code="missing_material",
+            message="Encountered mesh faces referencing a missing material slot; using white fallback color.",
+        )
+
+
+def _addon_version_string() -> str:
+    return ".".join(str(part) for part in bl_info["version"])
+
+
+def _export_timestamp_utc() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _find_linked_image(node, visited: set) -> object | None:

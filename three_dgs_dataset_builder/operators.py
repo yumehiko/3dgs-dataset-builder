@@ -134,10 +134,16 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
                 settings.status_text = f"Completed {result.frame_count} frames / {result.point_count} points"
                 context.window_manager.progress_update(settings.progress_total)
                 for warning in result.warnings:
-                    self.report({"WARNING"}, warning)
+                    self.report({"WARNING"}, warning.message)
                 self.report(
                     {"INFO"},
-                    f"Generated {result.frame_count} frames and {result.point_count} points at {result.output_dir}",
+                    (
+                        f"Generated {result.frame_count} frames and {result.point_count} points "
+                        f"at {result.output_dir} "
+                        f"(warnings: {len(result.warnings)}, "
+                        f"fallback materials: {result.fallback_material_count}, "
+                        f"fallback triangles: {result.fallback_triangle_count})"
+                    ),
                 )
                 self._finish(context, cancelled=False)
                 return {"FINISHED"}

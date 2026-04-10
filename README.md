@@ -2,16 +2,17 @@
 
 Blender 5.x 用の addon。Brush でそのまま読み込める training dataset を生成することを主目的にしている。
 
-現行バージョンは `v0.2.0`。  
+現行バージョンは `v0.3.0`。  
 優先ターゲットは汎用 3DGS exporter ではなく、**Brush / Nerfstudio format 互換**。
 
 ## Current Status
 
-`v0.2` で確認できていること:
+`v0.3` で確認できていること:
 
 * Blender からランダム視点の PNG 群を出力できる
 * `transforms_train.json` / `transforms_test.json` を Brush が読める形式で書き出せる
 * `points3d.ply` を初期点群として読み込める
+* dataset ごとに `metadata.json` を出力し、warning / fallback 情報を残せる
 * Brush 上で、少なくともテストデータでは初期形状の再現と学習進行を確認できている
 
 ## Supported Workflow
@@ -22,6 +23,7 @@ Blender 5.x 用の addon。Brush でそのまま読み込める training dataset
 * `transforms_train.json`
 * `transforms_test.json`
 * `points3d.ply`
+* `metadata.json`
 
 UI:
 
@@ -64,6 +66,20 @@ UI:
 
 unsupported な場合は、画像テクスチャ色を取れなければ `Base Color`、それも難しければ白に近い fallback を使う。
 
+`v0.3` ではこの fallback 情報を `metadata.json` に記録する。
+
+主に残すもの:
+
+* addon version
+* export timestamp
+* frame count
+* point sample count
+* target collection 名
+* output image resolution
+* render engine
+* warning list
+* fallback material list と triangle 件数
+
 ## Render Behavior
 
 Blender の Scene Render 設定を基本的に尊重する。
@@ -89,7 +105,8 @@ Blender の Scene Render 設定を基本的に尊重する。
 * Brush 前提のため、汎用 3DGS exporter としての互換性はまだ整理していない
 * glass や複雑マテリアルでは、初期点群色は不正確になりやすい
 * modal 化で UI 応答性は改善したが、各フレームの render 自体は同期処理
-* unsupported material がどの程度 fallback したかの可視化はまだ弱い
+* `metadata.json` は成功完了時のみ出力する。cancel / error 時の診断永続化はまだ行わない
+* fallback の可視化は material / triangle 集計までで、複雑ノードの詳細解析までは行わない
 
 ## Verification
 
@@ -103,6 +120,12 @@ Blender の Scene Render 設定を基本的に尊重する。
 * Blender 上で dataset 出力
 * Brush 上で初期点群読込
 * テストデータでの学習進行確認
+
+手動確認観点:
+
+* dataset 出力後に `metadata.json` が生成される
+* fallback material を含むシーンで warning と `metadata.json` の内容が一致する
+* fallback のないシーンで warning 配列と fallback list が空になる
 
 ## Roadmap
 
