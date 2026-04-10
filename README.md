@@ -2,7 +2,7 @@
 
 3DGS Dataset Builder is a Blender 5.x addon for exporting training datasets that can be loaded directly into Brush.
 
-The current release is `v0.3.1`. The primary target is **Brush / Nerfstudio-style dataset compatibility**, not a general-purpose 3DGS exporter.
+The current release is `v0.3.2`. The primary target is **Brush / Nerfstudio-style dataset compatibility**, not a general-purpose 3DGS exporter.
 
 ## What It Exports
 
@@ -77,7 +77,7 @@ Example shape:
 
 ```json
 {
-  "addon_version": "0.3.1",
+  "addon_version": "0.3.2",
   "export_timestamp": "2026-04-10T12:34:56Z",
   "dataset_name": "example",
   "target_collection": "Collection",
@@ -112,6 +112,7 @@ Example shape:
 * This project is still optimized for Brush, not for multi-target 3DGS export.
 * Initial point color quality drops on complex materials.
 * Rendering is still dispatched one frame at a time; heavy scenes can remain slow even though the render itself now runs as a Blender job.
+* Point sampling now runs outside Blender's main UI thread, but the initial mesh and texture snapshot step can still take noticeable time on large assets.
 * `metadata.json` is written only for successful exports.
 * Fallback reporting currently stops at warning and aggregate counts, not deep node-level diagnosis.
 

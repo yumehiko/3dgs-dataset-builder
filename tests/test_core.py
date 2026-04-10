@@ -2,6 +2,13 @@ import math
 import random
 
 from three_dgs_dataset_builder.core.models import DatasetSettingsSnapshot, PointRecord, WarningRecord
+from three_dgs_dataset_builder.core.point_sampling import (
+    PlainImageData,
+    PlainMaterialData,
+    PlainTriangleData,
+    PointSamplingTaskData,
+    sample_points,
+)
 from three_dgs_dataset_builder.core.sampling import CLOSE_UP_BAND_FRACTION, generate_camera_samples
 from three_dgs_dataset_builder.core.serialization import (
     append_warning_once,
@@ -204,6 +211,60 @@ def test_serialize_ply_ascii_contains_header_and_rows():
     assert "element vertex 2" in text
     assert "1.00000000 2.00000000 3.00000000 4 5 6" in text
     assert "-1.50000000 0.00000000 8.25000000 255 0 127" in text
+
+
+def test_sample_points_generates_requested_count_from_plain_triangle_data():
+    task_data = PointSamplingTaskData(
+        triangles=(
+            PlainTriangleData(
+                vertices=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                uvs=None,
+                material_index=0,
+            ),
+        ),
+        cumulative_areas=(0.5,),
+        total_area=0.5,
+        sample_count=8,
+        random_seed=7,
+        materials=(PlainMaterialData(base_color=(12, 34, 56), image_index=None),),
+        images=(),
+    )
+
+    points = sample_points(task_data)
+
+    assert len(points) == 8
+    assert all(point.color == (12, 34, 56) for point in points)
+    assert all(point.z == 0.0 for point in points)
+
+
+def test_sample_points_uses_image_pixels_when_uvs_are_available():
+    image_pixels = (
+        1.0, 0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0, 1.0,
+        0.0, 0.0, 1.0, 1.0,
+        1.0, 1.0, 0.0, 1.0,
+    )
+    task_data = PointSamplingTaskData(
+        triangles=(
+            PlainTriangleData(
+                vertices=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                uvs=((0.99, 0.99), (0.99, 0.99), (0.99, 0.99)),
+                material_index=0,
+            ),
+        ),
+        cumulative_areas=(0.5,),
+        total_area=0.5,
+        sample_count=1,
+        random_seed=3,
+        materials=(PlainMaterialData(base_color=(0, 0, 0), image_index=0),),
+        images=(PlainImageData(width=2, height=2, pixels=image_pixels),),
+    )
+
+    points = sample_points(task_data)
+
+    assert len(points) == 1
+    assert points[0].color == (255, 255, 0)
+    assert points[0].z == 0.0
 
 
 def test_validate_settings_reports_common_errors():

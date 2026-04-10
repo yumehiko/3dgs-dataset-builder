@@ -2,6 +2,22 @@
 
 This document tracks completed milestones and released behavior.
 
+## v0.3.2
+
+Theme: responsive export workflow
+
+Included:
+
+* kept per-frame rendering on Blender render jobs instead of synchronous operator execution
+* moved point sampling into a separate Python worker process with progress polling
+* temporarily disabled render interface locking during dataset generation and restored it afterward
+
+Notes:
+
+* renders are still executed one frame at a time
+* large assets can still pause during the one-time point-sampling snapshot step before the worker starts
+* cancellation during an active frame is best-effort and may complete the current frame before stopping
+
 ## v0.3.1
 
 Theme: responsive rendering workflow

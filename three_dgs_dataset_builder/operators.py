@@ -1,18 +1,19 @@
 from pathlib import Path
-from time import perf_counter
 
 import bpy
 
 from .builder import (
     BuildSession,
+    cancel_point_sampling_worker,
     DatasetBuildError,
     begin_dataset_build,
     cleanup_dataset_build,
     finalize_rendered_frame,
     has_remaining_frames,
+    poll_point_sampling_worker,
     prepare_point_sampling,
     prepare_next_frame_render,
-    sample_point_chunk,
+    start_point_sampling_worker,
     write_outputs,
 )
 from .core.models import DatasetSettingsSnapshot
@@ -28,10 +29,6 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
     _timer = None
     _session: BuildSession | None = None
     _phase = "IDLE"
-    _point_chunk_size = 256
-    _point_chunk_min_size = 32
-    _point_chunk_max_size = 4096
-    _point_time_budget_seconds = 1.0 / 60.0
     _pending_frame_index: int | None = None
     _render_inflight = False
     _render_finished = False
@@ -82,7 +79,6 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
             return {"CANCELLED"}
 
         self._phase = "RENDER"
-        self._point_chunk_size = 256
         self._pending_frame_index = None
         self._render_inflight = False
         self._render_finished = False
@@ -157,13 +153,19 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
 
             elif self._phase == "POINTS_PREP":
                 prepare_point_sampling(context, self._session)
+                start_point_sampling_worker(self._session)
                 self._phase = "POINTS"
                 settings.status_text = (
                     f"Sampling points 0 / {self._session.snapshot.point_sample_count}"
                 )
 
             elif self._phase == "POINTS":
-                complete = self._sample_points_for_timeslice()
+                if settings.cancel_requested:
+                    cancel_point_sampling_worker(self._session)
+                    self.report({"WARNING"}, "Dataset generation cancelled.")
+                    self._finish(context, cancelled=True)
+                    return {"CANCELLED"}
+                complete = poll_point_sampling_worker(self._session)
                 point_state = self._session.point_state
                 settings.progress_current = self._session.snapshot.total_frames + point_state.sampled_count
                 settings.status_text = (
@@ -258,28 +260,6 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
             raise DatasetBuildError("Failed to start the render job.")
         if "FINISHED" in result:
             self._render_finished = True
-
-    def _sample_points_for_timeslice(self) -> bool:
-        started_at = perf_counter()
-        complete = False
-
-        while not complete:
-            chunk_started_at = perf_counter()
-            complete = sample_point_chunk(self._session, chunk_size=self._point_chunk_size)
-            chunk_elapsed = perf_counter() - chunk_started_at
-
-            if chunk_elapsed > self._point_time_budget_seconds * 1.5:
-                self._point_chunk_size = max(self._point_chunk_min_size, self._point_chunk_size // 2)
-            elif chunk_elapsed < self._point_time_budget_seconds * 0.35:
-                self._point_chunk_size = min(self._point_chunk_max_size, self._point_chunk_size * 2)
-
-            if complete:
-                return True
-
-            if perf_counter() - started_at >= self._point_time_budget_seconds:
-                return False
-
-        return complete
 
 
 class THREE_DGS_OT_cancel_dataset_generation(bpy.types.Operator):

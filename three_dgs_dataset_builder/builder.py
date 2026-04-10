@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import pickle
 import random
+import shutil
+import subprocess
+import sys
+import tempfile
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -13,6 +19,13 @@ from mathutils import Matrix, Vector
 
 from . import bl_info
 from .core.models import CameraSample, DatasetSettingsSnapshot, PointRecord, WarningRecord
+from .core.point_sampling import (
+    PlainImageData,
+    PlainMaterialData,
+    PlainTriangleData,
+    PointSamplingTaskData,
+    sample_points,
+)
 from .core.sampling import generate_camera_samples
 from .core.serialization import (
     append_warning_once,
@@ -61,11 +74,25 @@ class MaterialInfo:
 
 @dataclass(frozen=True)
 class TriangleRecord:
-    world_matrix: Matrix
-    vertices: tuple[Vector, Vector, Vector]
+    vertices: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ]
     uvs: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None
-    material_info: MaterialInfo
+    material_index: int
     cumulative_area: float
+
+
+@dataclass
+class PointSamplingWorkerState:
+    process: object | None
+    temp_dir: Path
+    task_path: Path
+    progress_path: Path
+    result_path: Path
+    error_path: Path
+    stderr_path: Path
 
 
 @dataclass
@@ -74,11 +101,14 @@ class PointSamplingState:
     cumulative_areas: list[float]
     total_area: float
     sample_count: int
-    rng: random.Random
+    materials: list[PlainMaterialData]
+    images: list[PlainImageData]
+    random_seed: int
     fallback_triangle_count: int = 0
     fallback_material_triangle_counts: dict[str, int] = field(default_factory=dict)
     points: list[PointRecord] = field(default_factory=list)
     sampled_count: int = 0
+    worker_state: PointSamplingWorkerState | None = None
 
 
 @dataclass
@@ -105,8 +135,7 @@ def build_dataset(context, settings, snapshot: DatasetSettingsSnapshot, output_d
         while has_remaining_frames(session):
             render_next_frame(session)
         prepare_point_sampling(context, session)
-        while not sample_point_chunk(session, chunk_size=max(1, snapshot.point_sample_count)):
-            pass
+        run_point_sampling_sync(session)
         return write_outputs(session)
     finally:
         cleanup_dataset_build(session)
@@ -212,31 +241,139 @@ def prepare_point_sampling(context, session: BuildSession) -> PointSamplingState
 def sample_point_chunk(session: BuildSession, chunk_size: int = 1000) -> bool:
     if session.point_state is None:
         raise DatasetBuildError("Point sampling has not been prepared.")
+    run_point_sampling_sync(session)
+    return True
+
+
+def run_point_sampling_sync(session: BuildSession) -> int:
+    if session.point_state is None:
+        raise DatasetBuildError("Point sampling has not been prepared.")
 
     point_state = session.point_state
-    remaining = point_state.sample_count - point_state.sampled_count
-    if remaining <= 0:
+    if point_state.points:
+        return len(point_state.points)
+
+    point_state.points = sample_points(_build_point_sampling_task_data(point_state))
+    point_state.sampled_count = len(point_state.points)
+    return point_state.sampled_count
+
+
+def start_point_sampling_worker(session: BuildSession) -> None:
+    if session.point_state is None:
+        raise DatasetBuildError("Point sampling has not been prepared.")
+
+    point_state = session.point_state
+    if point_state.worker_state is not None:
+        return
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="three_dgs_point_sampling_"))
+    task_path = temp_dir / "task.pkl"
+    progress_path = temp_dir / "progress.json"
+    result_path = temp_dir / "result.pkl"
+    error_path = temp_dir / "error.txt"
+    stderr_path = temp_dir / "stderr.txt"
+    task_path.write_bytes(pickle.dumps(_build_point_sampling_task_data(point_state)))
+
+    python_executable = _resolve_python_executable()
+    worker_script = Path(__file__).resolve().parent / "core" / "point_sampling_worker.py"
+    worker_env = os.environ.copy()
+    addon_parent = str(Path(__file__).resolve().parent.parent)
+    existing_pythonpath = worker_env.get("PYTHONPATH", "")
+    worker_env["PYTHONPATH"] = (
+        addon_parent if not existing_pythonpath else os.pathsep.join((addon_parent, existing_pythonpath))
+    )
+
+    stderr_handle = stderr_path.open("w", encoding="utf-8")
+    try:
+        process = subprocess.Popen(
+            [
+                python_executable,
+                str(worker_script),
+                str(task_path),
+                str(progress_path),
+                str(result_path),
+                str(error_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_handle,
+            env=worker_env,
+        )
+    except Exception:
+        stderr_handle.close()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    else:
+        stderr_handle.close()
+
+    point_state.worker_state = PointSamplingWorkerState(
+        process=process,
+        temp_dir=temp_dir,
+        task_path=task_path,
+        progress_path=progress_path,
+        result_path=result_path,
+        error_path=error_path,
+        stderr_path=stderr_path,
+    )
+
+
+def poll_point_sampling_worker(session: BuildSession) -> bool:
+    if session.point_state is None:
+        raise DatasetBuildError("Point sampling has not been prepared.")
+
+    point_state = session.point_state
+    worker_state = point_state.worker_state
+    if worker_state is None:
+        raise DatasetBuildError("Point sampling worker has not been started.")
+
+    if worker_state.progress_path.exists():
+        try:
+            progress_payload = json.loads(worker_state.progress_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            progress_payload = None
+        if isinstance(progress_payload, dict):
+            point_state.sampled_count = max(
+                point_state.sampled_count,
+                int(progress_payload.get("sampled_count", point_state.sampled_count)),
+            )
+
+    if worker_state.error_path.exists():
+        message = worker_state.error_path.read_text(encoding="utf-8").strip() or "Point sampling worker failed."
+        raise DatasetBuildError(message)
+
+    if worker_state.result_path.exists():
+        result_payload = pickle.loads(worker_state.result_path.read_bytes())
+        point_state.points = list(result_payload["points"])
+        point_state.sampled_count = int(result_payload.get("sampled_count", len(point_state.points)))
+        _wait_for_worker_process(worker_state.process)
         return True
 
-    for _ in range(min(chunk_size, remaining)):
-        pick = point_state.rng.random() * point_state.total_area
-        triangle_index = bisect_left(point_state.cumulative_areas, pick)
-        triangle = point_state.triangle_records[min(triangle_index, len(point_state.triangle_records) - 1)]
-        local_point, uv = _sample_triangle(triangle.vertices, triangle.uvs, point_state.rng)
-        world_point = triangle.world_matrix @ local_point
-        color = _resolve_point_color(triangle.material_info, uv)
-        converted_point = convert_point((world_point.x, world_point.y, world_point.z))
-        point_state.points.append(
-            PointRecord(
-                x=converted_point[0],
-                y=converted_point[1],
-                z=converted_point[2],
-                color=color,
-            )
-        )
-        point_state.sampled_count += 1
+    if worker_state.process is not None:
+        return_code = worker_state.process.poll()
+        if return_code is not None and return_code != 0:
+            stderr_text = ""
+            if worker_state.stderr_path.exists():
+                stderr_text = worker_state.stderr_path.read_text(encoding="utf-8").strip()
+            message = stderr_text or "Point sampling worker exited before producing a result."
+            raise DatasetBuildError(message)
 
-    return point_state.sampled_count >= point_state.sample_count
+    return False
+
+
+def cancel_point_sampling_worker(session: BuildSession) -> None:
+    point_state = session.point_state
+    if point_state is None or point_state.worker_state is None:
+        return
+    worker_state = point_state.worker_state
+    process = worker_state.process
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2.0)
+    point_state.worker_state = None
+    shutil.rmtree(worker_state.temp_dir, ignore_errors=True)
 
 
 def write_outputs(session: BuildSession) -> BuildResult:
@@ -296,6 +433,7 @@ def write_outputs(session: BuildSession) -> BuildResult:
 
 
 def cleanup_dataset_build(session: BuildSession) -> None:
+    cancel_point_sampling_worker(session)
     _restore_render_state(session.scene, session.render_state)
     _cleanup_temp_camera(session.temp_camera_obj)
 
@@ -428,6 +566,10 @@ def _prepare_point_sampling_state(
     cumulative_area = 0.0
     fallback_triangle_count = 0
     fallback_material_triangle_counts: dict[str, int] = {}
+    images: list[PlainImageData] = []
+    image_lookup: dict[int, int] = {}
+    materials: list[PlainMaterialData] = []
+    material_lookup: dict[tuple[tuple[int, int, int], int | None], int] = {}
 
     for obj in collection.all_objects:
         if obj.type != "MESH":
@@ -445,6 +587,10 @@ def _prepare_point_sampling_state(
 
             uv_layer = mesh.uv_layers.active.data if mesh.uv_layers.active else None
             material_infos = [_resolve_material_info(material) for material in mesh.materials]
+            material_indices = [
+                _intern_plain_material(material_info, materials, material_lookup, images, image_lookup)
+                for material_info in material_infos
+            ]
 
             for triangle in mesh.loop_triangles:
                 area = float(triangle.area)
@@ -456,6 +602,17 @@ def _prepare_point_sampling_state(
                     material_infos[material_index]
                     if 0 <= material_index < len(material_infos)
                     else _fallback_material_info("missing_material")
+                )
+                plain_material_index = (
+                    material_indices[material_index]
+                    if 0 <= material_index < len(material_indices)
+                    else _intern_plain_material(
+                        _fallback_material_info("missing_material"),
+                        materials,
+                        material_lookup,
+                        images,
+                        image_lookup,
+                    )
                 )
                 if material_info.fallback_code is not None:
                     fallback_triangle_count += 1
@@ -471,14 +628,16 @@ def _prepare_point_sampling_state(
                 cumulative_area += area
                 triangle_records.append(
                     TriangleRecord(
-                        world_matrix=evaluated_obj.matrix_world.copy(),
-                        vertices=tuple(mesh.vertices[index].co.copy() for index in triangle.vertices),
+                        vertices=tuple(
+                            _vector_to_tuple(evaluated_obj.matrix_world @ mesh.vertices[index].co)
+                            for index in triangle.vertices
+                        ),
                         uvs=(
                             tuple(tuple(float(v) for v in uv_layer[loop_index].uv) for loop_index in triangle.loops)
                             if uv_layer is not None
                             else None
                         ),
-                        material_info=material_info,
+                        material_index=plain_material_index,
                         cumulative_area=cumulative_area,
                     )
                 )
@@ -494,29 +653,12 @@ def _prepare_point_sampling_state(
         cumulative_areas=cumulative_areas,
         total_area=cumulative_areas[-1],
         sample_count=sample_count,
-        rng=random.Random(),
+        materials=materials,
+        images=images,
+        random_seed=random.randrange(0, 2**32),
         fallback_triangle_count=fallback_triangle_count,
         fallback_material_triangle_counts=fallback_material_triangle_counts,
     )
-
-
-def _sample_triangle(vertices, uvs, rng: random.Random):
-    r1 = rng.random()
-    r2 = rng.random()
-    sqrt_r1 = math.sqrt(r1)
-    weight_a = 1.0 - sqrt_r1
-    weight_b = sqrt_r1 * (1.0 - r2)
-    weight_c = sqrt_r1 * r2
-
-    point = vertices[0] * weight_a + vertices[1] * weight_b + vertices[2] * weight_c
-    if uvs is None:
-        return point, None
-
-    uv = (
-        uvs[0][0] * weight_a + uvs[1][0] * weight_b + uvs[2][0] * weight_c,
-        uvs[0][1] * weight_a + uvs[1][1] * weight_b + uvs[2][1] * weight_c,
-    )
-    return point, uv
 
 
 def _resolve_material_info(material) -> MaterialInfo:
@@ -634,24 +776,90 @@ def _find_linked_image(node, visited: set) -> object | None:
     return None
 
 
-def _resolve_point_color(material_info: MaterialInfo, uv) -> tuple[int, int, int]:
-    if material_info.image is None or uv is None:
-        return material_info.base_color
-    return _sample_image(material_info.image, uv) or material_info.base_color
+def _build_point_sampling_task_data(point_state: PointSamplingState) -> PointSamplingTaskData:
+    return PointSamplingTaskData(
+        triangles=tuple(
+            PlainTriangleData(
+                vertices=triangle.vertices,
+                uvs=triangle.uvs,
+                material_index=triangle.material_index,
+            )
+            for triangle in point_state.triangle_records
+        ),
+        cumulative_areas=tuple(point_state.cumulative_areas),
+        total_area=point_state.total_area,
+        sample_count=point_state.sample_count,
+        random_seed=point_state.random_seed,
+        materials=tuple(point_state.materials),
+        images=tuple(point_state.images),
+    )
 
 
-def _sample_image(image, uv) -> tuple[int, int, int] | None:
-    width, height = image.size
-    if width <= 0 or height <= 0:
+def _intern_plain_material(
+    material_info: MaterialInfo,
+    materials: list[PlainMaterialData],
+    material_lookup: dict[tuple[tuple[int, int, int], int | None], int],
+    images: list[PlainImageData],
+    image_lookup: dict[int, int],
+) -> int:
+    image_index = _intern_plain_image(material_info.image, images, image_lookup)
+    material_key = (material_info.base_color, image_index)
+    cached_index = material_lookup.get(material_key)
+    if cached_index is not None:
+        return cached_index
+
+    material_index = len(materials)
+    materials.append(PlainMaterialData(base_color=material_info.base_color, image_index=image_index))
+    material_lookup[material_key] = material_index
+    return material_index
+
+
+def _intern_plain_image(
+    image,
+    images: list[PlainImageData],
+    image_lookup: dict[int, int],
+) -> int | None:
+    if image is None:
         return None
+    image_key = id(image)
+    cached_index = image_lookup.get(image_key)
+    if cached_index is not None:
+        return cached_index
 
-    u = uv[0] % 1.0
-    v = uv[1] % 1.0
-    x = min(width - 1, max(0, int(u * (width - 1))))
-    y = min(height - 1, max(0, int(v * (height - 1))))
-    index = (y * width + x) * 4
-    pixels = image.pixels
-    return _color_to_byte_tuple((pixels[index], pixels[index + 1], pixels[index + 2]))
+    image_index = len(images)
+    width = int(image.size[0])
+    height = int(image.size[1])
+    images.append(
+        PlainImageData(
+            width=width,
+            height=height,
+            pixels=tuple(float(channel) for channel in image.pixels),
+        )
+    )
+    image_lookup[image_key] = image_index
+    return image_index
+
+
+def _resolve_python_executable() -> str:
+    blender_python = getattr(bpy.app, "binary_path_python", "")
+    if blender_python:
+        return blender_python
+    if sys.executable:
+        return sys.executable
+    raise DatasetBuildError("Could not resolve a Python interpreter for point sampling.")
+
+
+def _wait_for_worker_process(process) -> None:
+    if process is None:
+        return
+    try:
+        process.wait(timeout=0.1)
+    except subprocess.TimeoutExpired:
+        return
+
+
+def _vector_to_tuple(vector: Vector) -> tuple[float, float, float]:
+    return (float(vector.x), float(vector.y), float(vector.z))
 
 
 def _color_to_byte_tuple(color) -> tuple[int, int, int]:

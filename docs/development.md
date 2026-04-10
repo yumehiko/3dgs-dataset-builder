@@ -33,3 +33,18 @@ gh release create <tag> dist/three_dgs_dataset_builder.zip --title <tag> --notes
 * `README.md` is user-facing
 * `docs/roadmap.md` is future-facing only
 * `docs/releases.md` tracks completed milestones
+
+## Runtime Notes
+
+Current export execution is split across Blender and a worker process:
+
+* frame rendering is scheduled through Blender render jobs from the modal operator
+* point sampling snapshots Blender mesh / material / texture state into plain Python data first
+* the heavy point sampling loop then runs in a separate Python worker process
+* Blender UI progress during point sampling comes from polling worker-written progress files
+
+Implications for maintainers:
+
+* do not pass `bpy` objects directly into the worker process
+* keep Blender-only access inside the snapshot preparation path in `builder.py`
+* if point sampling behavior changes, keep the synchronous fallback and worker path logically aligned
