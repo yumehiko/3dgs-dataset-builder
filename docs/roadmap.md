@@ -1,79 +1,41 @@
 # Roadmap
 
-## v0.2
-
-現状の到達点:
-
-* Blender addon として install 可能
-* Brush 互換 dataset を出力可能
-* modal 実行と進捗表示あり
-* 初期点群の位置と、シンプルなマテリアルの色を出力可能
-
-## v0.3
-
-テーマ: warning / metadata の可視化
-
-予定:
-
-* 実行結果の warning をより明確に一覧化する
-* fallback が発生した material 名や件数を出力する
-* dataset ごとの `metadata.json` を追加する
-* 最低限の診断情報を残す
-
-候補項目:
-
-* addon version
-* export timestamp
-* frame count
-* point sample count
-* target collection 名
-* output image resolution
-* render engine
-* fallback material list
-* warning list
-
-目的:
-
-* 「なぜこの dataset 品質になったか」を後から追えるようにする
-* Brush で問題が出たときの切り分けを楽にする
+This document is for future work only. Released work is tracked in [releases.md](/Users/okamura-yumehiko/repository/3dgs-dataset-builder/docs/releases.md).
 
 ## v0.4
 
-テーマ: 実データでのテストと精度調整
+Theme: validation on real assets and practical tuning
 
-予定:
+Planned work:
 
-* 実運用データを使った複数ケース検証
-* 半径レンジ、close-up ratio、frame count、point count の調整
-* Brush 上での学習の進みやすさを観察して default 値を見直す
-* カメラ分布とレンダリング条件の実用チューニングを行う
+* validate the exporter on multiple real production assets
+* tune radius ranges, close-up ratio, frame count, and point count
+* revisit default values based on actual Brush training behavior
+* improve camera distribution and rendering defaults for practical use
 
-目的:
+Goal:
 
-* テスト用サンプルではなく、実運用の asset でも安定して結果が出る状態に近づける
+* move from test-scene validation toward stable results on real assets
 
 ## v0.5
 
-テーマ: 複雑マテリアルの強化
+Theme: better support for complex materials
 
-予定:
+Planned work:
 
-* 複雑ノードの色取得戦略を改善する
-* glass や視点依存材質に対する fallback 方針を整理する
-* procedural texture や複数ノード経路への対応可能性を調査する
-* 「何が正確に取れて、何は近似なのか」を明文化する
+* improve color extraction for more complex node graphs
+* define clearer fallback rules for glass and view-dependent materials
+* investigate support for procedural textures and multi-path node setups
+* document what is exact and what is approximate in point color export
 
-目的:
+Goal:
 
-* 初期点群色の品質を上げる
-* 複雑マテリアルを含む asset でも初期状態の見た目を改善する
+* improve the visual quality of the initial point cloud
+* make results more usable on assets with more complex materials
 
 ## Out Of Scope For Now
 
-当面は後回しにする項目:
-
-* 汎用 3DGS exporter としての多ターゲット対応
-* COLMAP 互換や OpenCV 事前変換の再導入
+* multi-target export as a general-purpose 3DGS exporter
+* reintroducing COLMAP compatibility or exporter-side OpenCV conversion
 * depth map export
 * lighting variation
-

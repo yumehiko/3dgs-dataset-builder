@@ -1,23 +1,12 @@
 # 3DGS Dataset Builder
 
-Blender 5.x 用の addon。Brush でそのまま読み込める training dataset を生成することを主目的にしている。
+3DGS Dataset Builder is a Blender 5.x addon for exporting training datasets that can be loaded directly into Brush.
 
-現行バージョンは `v0.3.0`。  
-優先ターゲットは汎用 3DGS exporter ではなく、**Brush / Nerfstudio format 互換**。
+The current release is `v0.3.0`. The primary target is **Brush / Nerfstudio-style dataset compatibility**, not a general-purpose 3DGS exporter.
 
-## Current Status
+## What It Exports
 
-`v0.3` で確認できていること:
-
-* Blender からランダム視点の PNG 群を出力できる
-* `transforms_train.json` / `transforms_test.json` を Brush が読める形式で書き出せる
-* `points3d.ply` を初期点群として読み込める
-* dataset ごとに `metadata.json` を出力し、warning / fallback 情報を残せる
-* Brush 上で、少なくともテストデータでは初期形状の再現と学習進行を確認できている
-
-## Supported Workflow
-
-出力レイアウト:
+Each dataset contains:
 
 * `images/*.png`
 * `transforms_train.json`
@@ -25,7 +14,11 @@ Blender 5.x 用の addon。Brush でそのまま読み込める training dataset
 * `points3d.ply`
 * `metadata.json`
 
-UI:
+## Workflow
+
+The addon renders randomized camera views around a target collection and exports a surface-sampled point cloud for initialization.
+
+Main UI fields:
 
 * `Save Path`
 * `Dataset Name`
@@ -40,93 +33,90 @@ UI:
 
 ## Brush Compatibility
 
-現行実装は Brush を前提にしている。
+The current implementation is intentionally Brush-oriented.
 
-* `transform_matrix` は Blender ワールド行列をそのまま書き出す
-* exporter 側で OpenCV 形式への事前変換はしない
-* `Include Extension` は Brush 互換のため `ON` 必須
-* `points3d.ply` は `ply_file_path` と同名ファイル探索の両方で拾えるように同ディレクトリへ出力する
+* `transform_matrix` is written from the Blender world matrix as-is.
+* The exporter does not pre-convert camera transforms to OpenCV format.
+* `Include Extension` must stay enabled for Brush compatibility.
+* `points3d.ply` is written into the dataset directory so Brush can find it through `ply_file_path` or same-directory lookup.
 
 ## Material Support
 
-初期点群の色は限定対応。
+Initial point colors are intentionally limited to simple, predictable cases.
 
-期待通りに色が出やすいもの:
+Works best with:
 
-* UV 展開済みメッシュ
+* UV-unwrapped meshes
 * `Principled BSDF`
-* `Base Color` に単色または画像テクスチャが接続されているケース
+* `Base Color` driven by a flat color or an image texture
 
-弱いもの:
+Weaker cases:
 
-* 複雑ノード
-* glass / transmission / reflection 依存の見た目
-* procedural texture 中心のマテリアル
-* UV 未設定
+* complex node graphs
+* glass / transmission / reflection-heavy looks
+* procedural-texture-driven materials
+* missing UVs
 
-unsupported な場合は、画像テクスチャ色を取れなければ `Base Color`、それも難しければ白に近い fallback を使う。
+When image texture sampling is not available, the exporter falls back to `Base Color`. If that is not usable, it falls back to a near-white color.
 
-`v0.3` ではこの fallback 情報を `metadata.json` に記録する。
+## Metadata
 
-主に残すもの:
+`metadata.json` stores lightweight diagnostic information for each successful export, including:
 
 * addon version
 * export timestamp
 * frame count
 * point sample count
-* target collection 名
+* target collection name
 * output image resolution
 * render engine
 * warning list
-* fallback material list と triangle 件数
+* fallback material summary
 
-## Render Behavior
+Example shape:
 
-Blender の Scene Render 設定を基本的に尊重する。
+```json
+{
+  "addon_version": "0.3.0",
+  "export_timestamp": "2026-04-10T12:34:56Z",
+  "dataset_name": "example",
+  "target_collection": "Collection",
+  "frame_count": 100,
+  "point_sample_count": 50000,
+  "image_resolution": {
+    "width": 1024,
+    "height": 1024
+  },
+  "render_engine": "CYCLES",
+  "warnings": [
+    {
+      "code": "material_base_color_fallback",
+      "message": "Material 'Mat_A' does not use a supported image texture chain; using base color fallback."
+    }
+  ],
+  "materials": {
+    "fallback_material_count": 1,
+    "fallback_triangle_count": 120,
+    "fallback_materials": [
+      {
+        "name": "Mat_A",
+        "triangle_count": 120
+      }
+    ]
+  }
+}
+```
 
-そのまま使うもの:
+## Limitations
 
-* render engine
-* resolution
-* resolution percentage
-* pixel aspect
-* 既存 camera の lens / sensor 系設定
+* This project is still optimized for Brush, not for multi-target 3DGS export.
+* Initial point color quality drops on complex materials.
+* Rendering still happens synchronously per frame even though execution is modal.
+* `metadata.json` is written only for successful exports.
+* Fallback reporting currently stops at warning and aggregate counts, not deep node-level diagnosis.
 
-一時的に上書きするもの:
+## Additional Docs
 
-* output format = `PNG`
-* color mode = `RGBA`
-* film transparent = `ON`
-* scene camera
-* render filepath
-
-## Known Limitations
-
-* Brush 前提のため、汎用 3DGS exporter としての互換性はまだ整理していない
-* glass や複雑マテリアルでは、初期点群色は不正確になりやすい
-* modal 化で UI 応答性は改善したが、各フレームの render 自体は同期処理
-* `metadata.json` は成功完了時のみ出力する。cancel / error 時の診断永続化はまだ行わない
-* fallback の可視化は material / triangle 集計までで、複雑ノードの詳細解析までは行わない
-
-## Verification
-
-ローカル確認済み:
-
-* `pytest -q`
-* `python3 -m compileall three_dgs_dataset_builder tests`
-
-手動確認済み:
-
-* Blender 上で dataset 出力
-* Brush 上で初期点群読込
-* テストデータでの学習進行確認
-
-手動確認観点:
-
-* dataset 出力後に `metadata.json` が生成される
-* fallback material を含むシーンで warning と `metadata.json` の内容が一致する
-* fallback のないシーンで warning 配列と fallback list が空になる
-
-## Roadmap
-
-今後の予定は [docs/roadmap.md](docs/roadmap.md) に記載。
+* Future plans: [docs/roadmap.md](/Users/okamura-yumehiko/repository/3dgs-dataset-builder/docs/roadmap.md)
+* Release history: [docs/releases.md](/Users/okamura-yumehiko/repository/3dgs-dataset-builder/docs/releases.md)
+* Maintainer notes: [docs/development.md](/Users/okamura-yumehiko/repository/3dgs-dataset-builder/docs/development.md)
