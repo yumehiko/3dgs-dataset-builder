@@ -2,6 +2,21 @@
 
 This document tracks completed milestones and released behavior.
 
+## v0.3.4
+
+Theme: crash triage and memory pressure reduction
+
+Included:
+
+* moved point sampling ahead of image rendering so suspected failures surface earlier in the export
+* reduced point-sampling snapshot memory overhead by packing image pixels more tightly and avoiding extra serialization copies
+* added `three_dgs_dataset_builder.log` with phase-level diagnostics, worker errors, and Python fatal-signal traces when available
+
+Notes:
+
+* very large scenes can still stress Blender-native render or texture caches outside the Python-side snapshot
+* `three_dgs_dataset_builder.log` is written from export start and should be collected first when reporting a crash
+
 ## v0.3.3
 
 Theme: documentation and sampling correctness

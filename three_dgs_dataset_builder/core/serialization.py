@@ -80,11 +80,12 @@ def build_metadata_payload(
     image_width: int,
     image_height: int,
     render_engine: str,
+    diagnostics_log_file: str | None,
     warnings: Sequence[WarningRecord],
     fallback_triangle_count: int,
     fallback_material_triangle_counts: Mapping[str, int],
 ) -> dict:
-    return {
+    payload = {
         "addon_version": addon_version,
         "export_timestamp": export_timestamp,
         "dataset_name": dataset_name,
@@ -108,6 +109,9 @@ def build_metadata_payload(
             fallback_material_triangle_counts=fallback_material_triangle_counts,
         ),
     }
+    if diagnostics_log_file:
+        payload["diagnostics"] = {"log_file": diagnostics_log_file}
+    return payload
 
 
 def serialize_ply_ascii(points: list[PointRecord]) -> str:

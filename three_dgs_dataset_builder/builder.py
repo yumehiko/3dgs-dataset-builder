@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from bisect import bisect_left
+from array import array
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,7 +36,8 @@ from .core.serialization import (
     build_transforms_payload,
     serialize_ply_ascii,
 )
-from .core.transforms import convert_point, convert_transform_rows
+from .core.transforms import convert_transform_rows
+from .diagnostics import DiagnosticsSession, format_peak_rss_mb, start_diagnostics
 
 
 class DatasetBuildError(RuntimeError):
@@ -72,18 +73,6 @@ class MaterialInfo:
     fallback_code: str | None
 
 
-@dataclass(frozen=True)
-class TriangleRecord:
-    vertices: tuple[
-        tuple[float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-    ]
-    uvs: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None
-    material_index: int
-    cumulative_area: float
-
-
 @dataclass
 class PointSamplingWorkerState:
     process: object | None
@@ -97,13 +86,15 @@ class PointSamplingWorkerState:
 
 @dataclass
 class PointSamplingState:
-    triangle_records: list[TriangleRecord]
-    cumulative_areas: list[float]
+    triangles: list[PlainTriangleData]
+    cumulative_areas: array
     total_area: float
     sample_count: int
     materials: list[PlainMaterialData]
     images: list[PlainImageData]
     random_seed: int
+    texture_count: int
+    texture_bytes: int
     fallback_triangle_count: int = 0
     fallback_material_triangle_counts: dict[str, int] = field(default_factory=dict)
     points: list[PointRecord] = field(default_factory=list)
@@ -122,6 +113,7 @@ class BuildSession:
     temp_camera_obj: object
     focus_point: Vector
     camera_info: dict
+    diagnostics: DiagnosticsSession
     samples: list[CameraSample]
     frames: list[dict] = field(default_factory=list)
     warnings: list[WarningRecord] = field(default_factory=list)
@@ -132,10 +124,10 @@ class BuildSession:
 def build_dataset(context, settings, snapshot: DatasetSettingsSnapshot, output_dir: Path) -> BuildResult:
     session = begin_dataset_build(context, settings, snapshot, output_dir)
     try:
-        while has_remaining_frames(session):
-            render_next_frame(session)
         prepare_point_sampling(context, session)
         run_point_sampling_sync(session)
+        while has_remaining_frames(session):
+            render_next_frame(session)
         return write_outputs(session)
     finally:
         cleanup_dataset_build(session)
@@ -153,6 +145,7 @@ def begin_dataset_build(context, settings, snapshot: DatasetSettingsSnapshot, ou
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dir = output_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics = start_diagnostics(output_dir, dataset_name=snapshot.dataset_name)
 
     scene = context.scene
     render_state = _capture_render_state(scene)
@@ -171,6 +164,7 @@ def begin_dataset_build(context, settings, snapshot: DatasetSettingsSnapshot, ou
             temp_camera_obj=temp_camera_obj,
             focus_point=_resolve_focus_point(settings.focus_object),
             camera_info=_build_camera_info(scene, temp_camera_obj),
+            diagnostics=diagnostics,
             samples=generate_camera_samples(
                 total_frames=snapshot.total_frames,
                 min_radius=snapshot.min_radius,
@@ -180,9 +174,17 @@ def begin_dataset_build(context, settings, snapshot: DatasetSettingsSnapshot, ou
                 rng=random.Random(),
             ),
         )
+        diagnostics.info(
+            "Dataset build initialized "
+            f"(frames={snapshot.total_frames}, samples={snapshot.point_sample_count}, "
+            f"render={scene.render.engine}, resolution={int(session.camera_info['w'])}x{int(session.camera_info['h'])}, "
+            f"peak_rss={format_peak_rss_mb()})."
+        )
     except Exception:
+        diagnostics.exception("Dataset build initialization failed.")
         _restore_render_state(scene, render_state)
         _cleanup_temp_camera(temp_camera_obj)
+        diagnostics.close()
         raise
 
     return session
@@ -206,6 +208,10 @@ def prepare_next_frame_render(session: BuildSession) -> int:
     _place_camera(session.temp_camera_obj, sample.position, session.focus_point)
     render_stem = session.images_dir / build_render_stem(frame_index)
     session.scene.render.filepath = str(render_stem)
+    session.diagnostics.info(
+        f"Starting render for frame {frame_index + 1}/{session.snapshot.total_frames} "
+        f"(output={render_stem.name}.png, peak_rss={format_peak_rss_mb()})."
+    )
     return frame_index
 
 
@@ -220,6 +226,10 @@ def finalize_rendered_frame(session: BuildSession, frame_index: int) -> int:
             "transform_matrix": convert_transform_rows(_matrix_to_rows(session.temp_camera_obj.matrix_world)),
         }
     )
+    session.diagnostics.info(
+        f"Completed render for frame {frame_index + 1}/{session.snapshot.total_frames} "
+        f"(peak_rss={format_peak_rss_mb()})."
+    )
     return len(session.frames)
 
 
@@ -227,14 +237,21 @@ def prepare_point_sampling(context, session: BuildSession) -> PointSamplingState
     if session.point_state is not None:
         return session.point_state
 
+    session.diagnostics.info(f"Preparing point sampling state (peak_rss={format_peak_rss_mb()}).")
     point_state = _prepare_point_sampling_state(
         context=context,
         collection=session.target_collection,
         warnings=session.warnings,
         warning_keys=session.warning_keys,
         sample_count=session.snapshot.point_sample_count,
+        diagnostics=session.diagnostics,
     )
     session.point_state = point_state
+    session.diagnostics.info(
+        "Prepared point sampling state "
+        f"(triangles={len(point_state.triangles)}, textures={point_state.texture_count}, "
+        f"texture_bytes={_format_bytes(point_state.texture_bytes)}, peak_rss={format_peak_rss_mb()})."
+    )
     return point_state
 
 
@@ -253,8 +270,15 @@ def run_point_sampling_sync(session: BuildSession) -> int:
     if point_state.points:
         return len(point_state.points)
 
+    session.diagnostics.info(
+        "Starting synchronous point sampling "
+        f"(samples={point_state.sample_count}, peak_rss={format_peak_rss_mb()})."
+    )
     point_state.points = sample_points(_build_point_sampling_task_data(point_state))
     point_state.sampled_count = len(point_state.points)
+    session.diagnostics.info(
+        f"Completed synchronous point sampling (points={point_state.sampled_count}, peak_rss={format_peak_rss_mb()})."
+    )
     return point_state.sampled_count
 
 
@@ -272,7 +296,7 @@ def start_point_sampling_worker(session: BuildSession) -> None:
     result_path = temp_dir / "result.pkl"
     error_path = temp_dir / "error.txt"
     stderr_path = temp_dir / "stderr.txt"
-    task_path.write_bytes(pickle.dumps(_build_point_sampling_task_data(point_state)))
+    _write_pickle(task_path, _build_point_sampling_task_data(point_state))
 
     python_executable = _resolve_python_executable()
     worker_script = Path(__file__).resolve().parent / "core" / "point_sampling_worker.py"
@@ -285,6 +309,10 @@ def start_point_sampling_worker(session: BuildSession) -> None:
 
     stderr_handle = stderr_path.open("w", encoding="utf-8")
     try:
+        session.diagnostics.info(
+            "Starting point sampling worker "
+            f"(task_dir={temp_dir}, samples={point_state.sample_count}, peak_rss={format_peak_rss_mb()})."
+        )
         process = subprocess.Popen(
             [
                 python_executable,
@@ -314,6 +342,8 @@ def start_point_sampling_worker(session: BuildSession) -> None:
         error_path=error_path,
         stderr_path=stderr_path,
     )
+    _release_point_sampling_inputs(point_state)
+    session.diagnostics.info(f"Point sampling worker started (pid={process.pid}, peak_rss={format_peak_rss_mb()}).")
 
 
 def poll_point_sampling_worker(session: BuildSession) -> bool:
@@ -338,13 +368,17 @@ def poll_point_sampling_worker(session: BuildSession) -> bool:
 
     if worker_state.error_path.exists():
         message = worker_state.error_path.read_text(encoding="utf-8").strip() or "Point sampling worker failed."
+        session.diagnostics.error(f"Point sampling worker reported an error:\n{message}")
         raise DatasetBuildError(message)
 
     if worker_state.result_path.exists():
-        result_payload = pickle.loads(worker_state.result_path.read_bytes())
+        result_payload = _read_pickle(worker_state.result_path)
         point_state.points = list(result_payload["points"])
         point_state.sampled_count = int(result_payload.get("sampled_count", len(point_state.points)))
         _wait_for_worker_process(worker_state.process)
+        session.diagnostics.info(
+            f"Point sampling worker completed (points={point_state.sampled_count}, peak_rss={format_peak_rss_mb()})."
+        )
         return True
 
     if worker_state.process is not None:
@@ -354,6 +388,7 @@ def poll_point_sampling_worker(session: BuildSession) -> bool:
             if worker_state.stderr_path.exists():
                 stderr_text = worker_state.stderr_path.read_text(encoding="utf-8").strip()
             message = stderr_text or "Point sampling worker exited before producing a result."
+            session.diagnostics.error(f"Point sampling worker exited with code {return_code}: {message}")
             raise DatasetBuildError(message)
 
     return False
@@ -366,10 +401,12 @@ def cancel_point_sampling_worker(session: BuildSession) -> None:
     worker_state = point_state.worker_state
     process = worker_state.process
     if process is not None and process.poll() is None:
+        session.diagnostics.warning(f"Terminating point sampling worker pid={process.pid}.")
         process.terminate()
         try:
             process.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
+            session.diagnostics.warning(f"Killing unresponsive point sampling worker pid={process.pid}.")
             process.kill()
             process.wait(timeout=2.0)
     point_state.worker_state = None
@@ -413,6 +450,7 @@ def write_outputs(session: BuildSession) -> BuildResult:
                 image_width=int(session.camera_info["w"]),
                 image_height=int(session.camera_info["h"]),
                 render_engine=session.scene.render.engine,
+                diagnostics_log_file=session.diagnostics.log_path.name,
                 warnings=session.warnings,
                 fallback_triangle_count=session.point_state.fallback_triangle_count,
                 fallback_material_triangle_counts=session.point_state.fallback_material_triangle_counts,
@@ -420,6 +458,10 @@ def write_outputs(session: BuildSession) -> BuildResult:
             indent=2,
         ),
         encoding="utf-8",
+    )
+    session.diagnostics.info(
+        "Wrote dataset outputs "
+        f"(frames={len(session.frames)}, points={len(session.point_state.points)}, peak_rss={format_peak_rss_mb()})."
     )
 
     return BuildResult(
@@ -433,9 +475,12 @@ def write_outputs(session: BuildSession) -> BuildResult:
 
 
 def cleanup_dataset_build(session: BuildSession) -> None:
-    cancel_point_sampling_worker(session)
-    _restore_render_state(session.scene, session.render_state)
-    _cleanup_temp_camera(session.temp_camera_obj)
+    try:
+        cancel_point_sampling_worker(session)
+        _restore_render_state(session.scene, session.render_state)
+        _cleanup_temp_camera(session.temp_camera_obj)
+    finally:
+        session.diagnostics.close()
 
 
 def _capture_render_state(scene) -> RenderState:
@@ -559,10 +604,11 @@ def _prepare_point_sampling_state(
     warnings: list[WarningRecord],
     warning_keys: set[str],
     sample_count: int,
+    diagnostics: DiagnosticsSession,
 ) -> PointSamplingState:
     depsgraph = context.evaluated_depsgraph_get()
-    triangle_records: list[TriangleRecord] = []
-    cumulative_areas: list[float] = []
+    triangles: list[PlainTriangleData] = []
+    cumulative_areas = array("d")
     cumulative_area = 0.0
     fallback_triangle_count = 0
     fallback_material_triangle_counts: dict[str, int] = {}
@@ -570,6 +616,7 @@ def _prepare_point_sampling_state(
     image_lookup: dict[int, int] = {}
     materials: list[PlainMaterialData] = []
     material_lookup: dict[tuple[tuple[int, int, int], int | None], int] = {}
+    texture_bytes = 0
 
     for obj in collection.all_objects:
         if obj.type != "MESH":
@@ -588,7 +635,14 @@ def _prepare_point_sampling_state(
             uv_layer = mesh.uv_layers.active.data if mesh.uv_layers.active else None
             material_infos = [_resolve_material_info(material) for material in mesh.materials]
             material_indices = [
-                _intern_plain_material(material_info, materials, material_lookup, images, image_lookup)
+                _intern_plain_material(
+                    material_info,
+                    materials,
+                    material_lookup,
+                    images,
+                    image_lookup,
+                    diagnostics,
+                )
                 for material_info in material_infos
             ]
 
@@ -612,6 +666,7 @@ def _prepare_point_sampling_state(
                         material_lookup,
                         images,
                         image_lookup,
+                        diagnostics,
                     )
                 )
                 if material_info.fallback_code is not None:
@@ -626,8 +681,8 @@ def _prepare_point_sampling_state(
                         warning_keys,
                     )
                 cumulative_area += area
-                triangle_records.append(
-                    TriangleRecord(
+                triangles.append(
+                    PlainTriangleData(
                         vertices=tuple(
                             _vector_to_tuple(evaluated_obj.matrix_world @ mesh.vertices[index].co)
                             for index in triangle.vertices
@@ -638,24 +693,27 @@ def _prepare_point_sampling_state(
                             else None
                         ),
                         material_index=plain_material_index,
-                        cumulative_area=cumulative_area,
                     )
                 )
                 cumulative_areas.append(cumulative_area)
         finally:
             evaluated_obj.to_mesh_clear()
 
-    if not triangle_records:
+    texture_bytes = sum(len(image.pixels) * image.pixels.itemsize for image in images)
+
+    if not triangles:
         raise DatasetBuildError("Target collection does not contain any renderable mesh surface.")
 
     return PointSamplingState(
-        triangle_records=triangle_records,
+        triangles=triangles,
         cumulative_areas=cumulative_areas,
         total_area=cumulative_areas[-1],
         sample_count=sample_count,
         materials=materials,
         images=images,
         random_seed=random.randrange(0, 2**32),
+        texture_count=len(images),
+        texture_bytes=texture_bytes,
         fallback_triangle_count=fallback_triangle_count,
         fallback_material_triangle_counts=fallback_material_triangle_counts,
     )
@@ -778,20 +836,13 @@ def _find_linked_image(node, visited: set) -> object | None:
 
 def _build_point_sampling_task_data(point_state: PointSamplingState) -> PointSamplingTaskData:
     return PointSamplingTaskData(
-        triangles=tuple(
-            PlainTriangleData(
-                vertices=triangle.vertices,
-                uvs=triangle.uvs,
-                material_index=triangle.material_index,
-            )
-            for triangle in point_state.triangle_records
-        ),
-        cumulative_areas=tuple(point_state.cumulative_areas),
+        triangles=point_state.triangles,
+        cumulative_areas=point_state.cumulative_areas,
         total_area=point_state.total_area,
         sample_count=point_state.sample_count,
         random_seed=point_state.random_seed,
-        materials=tuple(point_state.materials),
-        images=tuple(point_state.images),
+        materials=point_state.materials,
+        images=point_state.images,
     )
 
 
@@ -801,8 +852,9 @@ def _intern_plain_material(
     material_lookup: dict[tuple[tuple[int, int, int], int | None], int],
     images: list[PlainImageData],
     image_lookup: dict[int, int],
+    diagnostics: DiagnosticsSession,
 ) -> int:
-    image_index = _intern_plain_image(material_info.image, images, image_lookup)
+    image_index = _intern_plain_image(material_info.image, images, image_lookup, diagnostics)
     material_key = (material_info.base_color, image_index)
     cached_index = material_lookup.get(material_key)
     if cached_index is not None:
@@ -818,6 +870,7 @@ def _intern_plain_image(
     image,
     images: list[PlainImageData],
     image_lookup: dict[int, int],
+    diagnostics: DiagnosticsSession,
 ) -> int | None:
     if image is None:
         return None
@@ -829,14 +882,28 @@ def _intern_plain_image(
     image_index = len(images)
     width = int(image.size[0])
     height = int(image.size[1])
+    pixel_count = width * height * 4
+    pixels = array("f", [0.0]) * pixel_count
+    if hasattr(image.pixels, "foreach_get"):
+        image.pixels.foreach_get(pixels)
+    else:
+        pixels = array("f", image.pixels[:])
     images.append(
         PlainImageData(
             width=width,
             height=height,
-            pixels=tuple(float(channel) for channel in image.pixels),
+            pixels=pixels,
         )
     )
     image_lookup[image_key] = image_index
+    diagnostics.info(
+        f"Snapshot image texture {image.name!r} ({width}x{height}, packed={_format_bytes(len(pixels) * pixels.itemsize)})."
+    )
+    if hasattr(image, "buffers_free"):
+        try:
+            image.buffers_free()
+        except Exception:
+            diagnostics.warning(f"Failed to free Blender buffer for image texture {image.name!r}.")
     return image_index
 
 
@@ -856,6 +923,36 @@ def _wait_for_worker_process(process) -> None:
         process.wait(timeout=0.1)
     except subprocess.TimeoutExpired:
         return
+
+
+def _release_point_sampling_inputs(point_state: PointSamplingState) -> None:
+    point_state.triangles.clear()
+    point_state.cumulative_areas = array("d")
+    point_state.total_area = 0.0
+    point_state.materials.clear()
+    point_state.images.clear()
+
+
+def _write_pickle(path: Path, payload) -> None:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    temp_path.replace(path)
+
+
+def _read_pickle(path: Path):
+    with path.open("rb") as handle:
+        return pickle.load(handle)
+
+
+def _format_bytes(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KiB"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MiB"
+    return f"{size / (1024 * 1024 * 1024):.2f} GiB"
 
 
 def _vector_to_tuple(vector: Vector) -> tuple[float, float, float]:

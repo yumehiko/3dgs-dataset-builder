@@ -4,7 +4,7 @@ Language: [English](README.md) | 日本語
 
 3DGS Dataset Builder は、Blender のコレクションから Brush 互換の学習用データセットを出力する Blender 5.x アドオンです。
 
-現在のリリース: `v0.3.3`
+現在のリリース: `v0.3.4`
 
 ## 概要
 
@@ -44,7 +44,7 @@ Language: [English](README.md) | 日本語
 5. カメラの注視先を特定オブジェクトにしたい場合は `Focus Object` を設定します。空の場合はワールド原点を使います。
 6. フレーム数、カメラ半径、点群サンプル数を調整します。
 7. `Generate Dataset` をクリックします。
-8. レンダリング、点群サンプリング、最終書き出しが完了するまで待ちます。
+8. 点群サンプリング、レンダリング、最終書き出しが完了するまで待ちます。
 
 ## UI 項目
 
@@ -85,6 +85,7 @@ my_dataset/
 │   └── ...
 ├── metadata.json
 ├── points3d.ply
+├── three_dgs_dataset_builder.log
 ├── transforms_test.json
 └── transforms_train.json
 ```
@@ -94,6 +95,7 @@ my_dataset/
 * `transforms_train.json` にはレンダリングしたフレームが入ります。
 * `transforms_test.json` は `frames` が空配列の状態で出力されます。
 * `metadata.json` は成功時のみ書き出されます。
+* `three_dgs_dataset_builder.log` は開始直後から書かれるので、途中クラッシュ時でも回収できます。
 
 ## 推奨シーン構成
 
@@ -117,7 +119,9 @@ my_dataset/
 * `Brush compatibility requires Include Extension to be enabled.`
 * `Min Radius must be smaller than Max Radius.`
 
-大きいアセットで止まって見える場合、重いのは最初のレンダーパスか、ワーカープロセスが進捗を出し始める前の点群サンプリング準備であることが多いです。
+大きいアセットで止まって見える場合、重いのはワーカープロセスが進捗を出し始める前の点群サンプリング準備か、その後のレンダーパスであることが多いです。
+
+Blender が途中でクラッシュしたり強制終了された場合は、まず出力先フォルダの `three_dgs_dataset_builder.log` を回収してください。フェーズ遷移、テクスチャ取り込みサイズ、ワーカー起動、可能な場合は Python の致命シグナル情報まで残るようにしています。
 
 ## 関連ドキュメント
 

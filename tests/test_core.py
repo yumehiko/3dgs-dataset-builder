@@ -153,6 +153,7 @@ def test_build_metadata_payload_contains_warning_and_material_sections():
         image_width=1024,
         image_height=1024,
         render_engine="CYCLES",
+        diagnostics_log_file="three_dgs_dataset_builder.log",
         warnings=[
             WarningRecord(
                 code="material_base_color_fallback",
@@ -176,6 +177,7 @@ def test_build_metadata_payload_contains_warning_and_material_sections():
         "point_sample_count": 50000,
         "image_resolution": {"width": 1024, "height": 1024},
         "render_engine": "CYCLES",
+        "diagnostics": {"log_file": "three_dgs_dataset_builder.log"},
         "warnings": [
             {
                 "code": "material_base_color_fallback",

@@ -5,6 +5,7 @@ import math
 import pickle
 import random
 import traceback
+from collections.abc import Sequence
 from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,7 @@ from .transforms import convert_point
 class PlainImageData:
     width: int
     height: int
-    pixels: tuple[float, ...]
+    pixels: Sequence[float]
 
 
 @dataclass(frozen=True)
@@ -46,13 +47,13 @@ class PlainTriangleData:
 
 @dataclass(frozen=True)
 class PointSamplingTaskData:
-    triangles: tuple[PlainTriangleData, ...]
-    cumulative_areas: tuple[float, ...]
+    triangles: Sequence[PlainTriangleData]
+    cumulative_areas: Sequence[float]
     total_area: float
     sample_count: int
     random_seed: int
-    materials: tuple[PlainMaterialData, ...]
-    images: tuple[PlainImageData, ...]
+    materials: Sequence[PlainMaterialData]
+    images: Sequence[PlainImageData]
 
 
 def sample_points(
@@ -94,7 +95,7 @@ def sample_points(
 
 def run_worker(task_path: Path, progress_path: Path, result_path: Path, error_path: Path) -> int:
     try:
-        task_data = pickle.loads(task_path.read_bytes())
+        task_data = _read_pickle(task_path)
         points = sample_points(
             task_data,
             progress_callback=lambda sampled_count: _write_progress(progress_path, sampled_count),
@@ -136,7 +137,7 @@ def _sample_triangle(vertices, uvs, rng: random.Random):
 
 def _resolve_point_color(
     material: PlainMaterialData,
-    images: tuple[PlainImageData, ...],
+    images: Sequence[PlainImageData],
     uv,
 ) -> tuple[int, int, int]:
     if material.image_index is None or uv is None:
@@ -166,8 +167,14 @@ def _color_to_byte_tuple(color) -> tuple[int, int, int]:
 
 def _write_pickle(path: Path, payload) -> None:
     temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_bytes(pickle.dumps(payload))
+    with temp_path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
     temp_path.replace(path)
+
+
+def _read_pickle(path: Path):
+    with path.open("rb") as handle:
+        return pickle.load(handle)
 
 
 def _write_progress(path: Path, sampled_count: int) -> None:

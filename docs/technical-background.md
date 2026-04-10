@@ -17,6 +17,7 @@ Each dataset contains:
 * `transforms_test.json`
 * `points3d.ply`
 * `metadata.json`
+* `three_dgs_dataset_builder.log`
 
 `transforms_train.json` stores the exported camera frames, and `transforms_test.json` is currently emitted as the same camera metadata with an empty `frames` array.
 
@@ -60,6 +61,7 @@ When image texture sampling is not available, the exporter falls back to `Base C
 * point sample count
 * output image resolution
 * render engine
+* diagnostics log file name
 * warning list
 * fallback material summary
 
@@ -67,7 +69,7 @@ Example shape:
 
 ```json
 {
-  "addon_version": "0.3.3",
+  "addon_version": "0.3.4",
   "export_timestamp": "2026-04-10T12:34:56Z",
   "dataset_name": "example",
   "target_collection": "Collection",
@@ -78,6 +80,9 @@ Example shape:
     "height": 1024
   },
   "render_engine": "CYCLES",
+  "diagnostics": {
+    "log_file": "three_dgs_dataset_builder.log"
+  },
   "warnings": [
     {
       "code": "material_base_color_fallback",
@@ -101,12 +106,12 @@ Example shape:
 
 Current export execution is split across Blender and a worker process:
 
-* frame rendering is scheduled through Blender render jobs from the modal operator
 * point sampling snapshots Blender mesh, material, and texture state into plain Python data first
 * the heavy point sampling loop then runs in a separate Python worker process
+* frame rendering is scheduled through Blender render jobs from the modal operator after point sampling finishes
 * Blender UI progress during point sampling comes from polling worker-written progress files
 
-This keeps the export workflow more responsive than a fully synchronous implementation, but large scenes can still pause during the one-time snapshot step before the worker starts.
+This keeps the export workflow more responsive than a fully synchronous implementation, but large scenes can still pause during the one-time snapshot step before the worker starts. The snapshot now packs texture pixels more tightly than before, but Blender-native caches can still dominate memory usage on heavy scenes.
 
 ## Current Limitations
 

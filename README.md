@@ -4,7 +4,7 @@ Language: English | [日本語](README.ja.md)
 
 3DGS Dataset Builder is a Blender 5.x addon that exports Brush-compatible training datasets from a Blender collection.
 
-Current release: `v0.3.3`
+Current release: `v0.3.4`
 
 ## Overview
 
@@ -44,7 +44,7 @@ The panel path is `View3D > Sidebar > 3DGS Dataset`.
 5. Optionally select `Focus Object` if the cameras should look at a specific object instead of world origin.
 6. Adjust frame count, camera radius, and point sample count.
 7. Click `Generate Dataset`.
-8. Wait for rendering, point sampling, and final file writing to finish.
+8. Wait for point sampling, rendering, and final file writing to finish.
 
 ## UI Reference
 
@@ -85,6 +85,7 @@ my_dataset/
 │   └── ...
 ├── metadata.json
 ├── points3d.ply
+├── three_dgs_dataset_builder.log
 ├── transforms_test.json
 └── transforms_train.json
 ```
@@ -94,6 +95,7 @@ Notes:
 * `transforms_train.json` contains the rendered frames.
 * `transforms_test.json` is written with an empty `frames` array.
 * `metadata.json` is written only on successful export.
+* `three_dgs_dataset_builder.log` is written from export start, so it can still be shared if Blender fails mid-run.
 
 ## Recommended Scene Setup
 
@@ -117,7 +119,9 @@ Common validation failures:
 * `Brush compatibility requires Include Extension to be enabled.`
 * `Min Radius must be smaller than Max Radius.`
 
-If export feels stalled on a large asset, the slow part is often the initial render pass or the one-time point-sampling preparation step before the worker process starts reporting progress.
+If export feels stalled on a large asset, the slow part is often the one-time point-sampling preparation step before the worker process starts reporting progress, or the render pass afterward.
+
+If Blender crashes or is force-quit during export, ask for `three_dgs_dataset_builder.log` from the dataset output directory first. It now records phase transitions, texture snapshot sizes, worker startup, and Python fatal-signal traces when available.
 
 ## More Documentation
 

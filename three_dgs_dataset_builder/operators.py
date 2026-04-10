@@ -78,7 +78,7 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
             self.report({"ERROR"}, f"Unexpected failure: {exc}")
             return {"CANCELLED"}
 
-        self._phase = "RENDER"
+        self._phase = "POINTS_PREP"
         self._pending_frame_index = None
         self._render_inflight = False
         self._render_finished = False
@@ -89,10 +89,11 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
         settings.cancel_requested = False
         settings.progress_current = 0
         settings.progress_total = snapshot.total_frames + snapshot.point_sample_count + 1
-        settings.status_text = f"Rendering 0 / {snapshot.total_frames}"
+        settings.status_text = "Preparing point sampling"
         context.window_manager.progress_begin(0, settings.progress_total)
         self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
         context.window_manager.modal_handler_add(self)
+        self.report({"INFO"}, f"Diagnostics log: {self._session.diagnostics.log_path}")
         self._tag_redraw(context)
         return {"RUNNING_MODAL"}
 
@@ -114,7 +115,31 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
             return {"CANCELLED"}
 
         try:
-            if self._phase == "RENDER":
+            if self._phase == "POINTS_PREP":
+                prepare_point_sampling(context, self._session)
+                start_point_sampling_worker(self._session)
+                self._phase = "POINTS"
+                settings.status_text = (
+                    f"Sampling points 0 / {self._session.snapshot.point_sample_count}"
+                )
+
+            elif self._phase == "POINTS":
+                if settings.cancel_requested:
+                    cancel_point_sampling_worker(self._session)
+                    self.report({"WARNING"}, "Dataset generation cancelled.")
+                    self._finish(context, cancelled=True)
+                    return {"CANCELLED"}
+                complete = poll_point_sampling_worker(self._session)
+                point_state = self._session.point_state
+                settings.progress_current = point_state.sampled_count
+                settings.status_text = (
+                    f"Sampling points {point_state.sampled_count} / {self._session.snapshot.point_sample_count}"
+                )
+                context.window_manager.progress_update(settings.progress_current)
+                if complete:
+                    self._phase = "RENDER"
+
+            elif self._phase == "RENDER":
                 if self._render_inflight and _is_render_job_running():
                     self._tag_redraw(context)
                     return {"RUNNING_MODAL"}
@@ -134,7 +159,7 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
                     self._pending_frame_index = None
                     self._render_inflight = False
                     self._render_finished = False
-                    settings.progress_current = rendered
+                    settings.progress_current = self._session.snapshot.point_sample_count + rendered
                     settings.status_text = f"Rendering {rendered} / {self._session.snapshot.total_frames}"
                     context.window_manager.progress_update(settings.progress_current)
                     if settings.cancel_requested:
@@ -142,7 +167,7 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
                         self._finish(context, cancelled=True)
                         return {"CANCELLED"}
                     if not has_remaining_frames(self._session):
-                        self._phase = "POINTS_PREP"
+                        self._phase = "WRITE"
 
                 elif not self._render_inflight:
                     if settings.cancel_requested:
@@ -150,30 +175,6 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
                         self._finish(context, cancelled=True)
                         return {"CANCELLED"}
                     self._start_next_render(context)
-
-            elif self._phase == "POINTS_PREP":
-                prepare_point_sampling(context, self._session)
-                start_point_sampling_worker(self._session)
-                self._phase = "POINTS"
-                settings.status_text = (
-                    f"Sampling points 0 / {self._session.snapshot.point_sample_count}"
-                )
-
-            elif self._phase == "POINTS":
-                if settings.cancel_requested:
-                    cancel_point_sampling_worker(self._session)
-                    self.report({"WARNING"}, "Dataset generation cancelled.")
-                    self._finish(context, cancelled=True)
-                    return {"CANCELLED"}
-                complete = poll_point_sampling_worker(self._session)
-                point_state = self._session.point_state
-                settings.progress_current = self._session.snapshot.total_frames + point_state.sampled_count
-                settings.status_text = (
-                    f"Sampling points {point_state.sampled_count} / {self._session.snapshot.point_sample_count}"
-                )
-                context.window_manager.progress_update(settings.progress_current)
-                if complete:
-                    self._phase = "WRITE"
 
             elif self._phase == "WRITE":
                 result = write_outputs(self._session)
@@ -196,10 +197,14 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
                 return {"FINISHED"}
 
         except DatasetBuildError as exc:
+            if self._session is not None:
+                self._session.diagnostics.error(f"Dataset build failed: {exc}")
             self.report({"ERROR"}, str(exc))
             self._finish(context, cancelled=True)
             return {"CANCELLED"}
         except Exception as exc:  # pragma: no cover - Blender runtime only.
+            if self._session is not None:
+                self._session.diagnostics.exception("Unexpected failure in modal dataset generation.")
             self.report({"ERROR"}, f"Unexpected failure: {exc}")
             self._finish(context, cancelled=True)
             return {"CANCELLED"}
@@ -252,6 +257,7 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
             f"Rendering {frame_index + 1} / {self._session.snapshot.total_frames}"
         )
         result = bpy.ops.render.render("INVOKE_DEFAULT", write_still=True)
+        self._session.diagnostics.info(f"Render operator returned {sorted(result)} for frame {frame_index + 1}.")
         if "CANCELLED" in result:
             self._pending_frame_index = None
             self._render_inflight = False
