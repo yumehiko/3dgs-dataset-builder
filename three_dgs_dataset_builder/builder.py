@@ -48,6 +48,7 @@ class RenderState:
     file_format: str
     color_mode: str
     film_transparent: bool
+    use_lock_interface: bool
 
 
 @dataclass(frozen=True)
@@ -163,12 +164,27 @@ def has_remaining_frames(session: BuildSession) -> bool:
 
 
 def render_next_frame(session: BuildSession) -> int:
+    frame_index = prepare_next_frame_render(session)
+    bpy.ops.render.render(write_still=True)
+    return finalize_rendered_frame(session, frame_index)
+
+
+def prepare_next_frame_render(session: BuildSession) -> int:
     frame_index = len(session.frames)
+    if frame_index >= len(session.samples):
+        raise DatasetBuildError("No remaining frames to render.")
     sample = session.samples[frame_index]
     _place_camera(session.temp_camera_obj, sample.position, session.focus_point)
     render_stem = session.images_dir / build_render_stem(frame_index)
     session.scene.render.filepath = str(render_stem)
-    bpy.ops.render.render(write_still=True)
+    return frame_index
+
+
+def finalize_rendered_frame(session: BuildSession, frame_index: int) -> int:
+    if frame_index != len(session.frames):
+        raise DatasetBuildError("Rendered frame index is out of sequence.")
+    if frame_index >= len(session.samples):
+        raise DatasetBuildError("Rendered frame index exceeds planned samples.")
     session.frames.append(
         {
             "file_path": build_frame_path(frame_index, session.snapshot.include_extension),
@@ -292,6 +308,7 @@ def _capture_render_state(scene) -> RenderState:
         file_format=scene.render.image_settings.file_format,
         color_mode=scene.render.image_settings.color_mode,
         film_transparent=scene.render.film_transparent,
+        use_lock_interface=scene.render.use_lock_interface,
     )
 
 
@@ -300,6 +317,7 @@ def _configure_render(scene) -> None:
     scene.render.image_settings.file_format = "PNG"
     scene.render.image_settings.color_mode = "RGBA"
     scene.render.film_transparent = True
+    scene.render.use_lock_interface = False
 
 
 def _restore_render_state(scene, state: RenderState) -> None:
@@ -309,6 +327,7 @@ def _restore_render_state(scene, state: RenderState) -> None:
     scene.render.image_settings.file_format = state.file_format
     scene.render.image_settings.color_mode = state.color_mode
     scene.render.film_transparent = state.film_transparent
+    scene.render.use_lock_interface = state.use_lock_interface
 
 
 def _create_temp_camera(scene):

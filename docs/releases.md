@@ -2,6 +2,21 @@
 
 This document tracks completed milestones and released behavior.
 
+## v0.3.1
+
+Theme: responsive rendering workflow
+
+Included:
+
+* switched per-frame rendering from synchronous execution to Blender render jobs
+* advanced the export pipeline through render completion and cancellation handlers
+* temporarily disabled render interface locking during dataset generation and restored it afterward
+
+Notes:
+
+* renders are still executed one frame at a time
+* cancellation during an active frame is best-effort and may complete the current frame before stopping
+
 ## v0.3.0
 
 Theme: warning and metadata visibility

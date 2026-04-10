@@ -1,4 +1,5 @@
 from pathlib import Path
+from time import perf_counter
 
 import bpy
 
@@ -7,9 +8,10 @@ from .builder import (
     DatasetBuildError,
     begin_dataset_build,
     cleanup_dataset_build,
+    finalize_rendered_frame,
     has_remaining_frames,
     prepare_point_sampling,
-    render_next_frame,
+    prepare_next_frame_render,
     sample_point_chunk,
     write_outputs,
 )
@@ -26,7 +28,14 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
     _timer = None
     _session: BuildSession | None = None
     _phase = "IDLE"
-    _point_chunk_size = 2000
+    _point_chunk_size = 256
+    _point_chunk_min_size = 32
+    _point_chunk_max_size = 4096
+    _point_time_budget_seconds = 1.0 / 60.0
+    _pending_frame_index: int | None = None
+    _render_inflight = False
+    _render_finished = False
+    _render_cancelled = False
 
     def invoke(self, context, event):
         settings = context.scene.three_dgs_settings
@@ -73,6 +82,13 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
             return {"CANCELLED"}
 
         self._phase = "RENDER"
+        self._point_chunk_size = 256
+        self._pending_frame_index = None
+        self._render_inflight = False
+        self._render_finished = False
+        self._render_cancelled = False
+        _set_active_generator(self)
+        _ensure_render_handlers_registered()
         settings.is_running = True
         settings.cancel_requested = False
         settings.progress_current = 0
@@ -96,19 +112,48 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
 
-        if settings.cancel_requested:
+        if settings.cancel_requested and not self._render_inflight:
             self.report({"WARNING"}, "Dataset generation cancelled.")
             self._finish(context, cancelled=True)
             return {"CANCELLED"}
 
         try:
             if self._phase == "RENDER":
-                rendered = render_next_frame(self._session)
-                settings.progress_current = rendered
-                settings.status_text = f"Rendering {rendered} / {self._session.snapshot.total_frames}"
-                context.window_manager.progress_update(settings.progress_current)
-                if not has_remaining_frames(self._session):
-                    self._phase = "POINTS_PREP"
+                if self._render_inflight and _is_render_job_running():
+                    self._tag_redraw(context)
+                    return {"RUNNING_MODAL"}
+
+                if self._render_cancelled:
+                    if settings.cancel_requested:
+                        self.report({"WARNING"}, "Dataset generation cancelled.")
+                    else:
+                        self.report({"ERROR"}, "Render job was cancelled before completion.")
+                    self._finish(context, cancelled=True)
+                    return {"CANCELLED"}
+
+                if self._render_finished:
+                    if self._pending_frame_index is None:
+                        raise DatasetBuildError("Render completion was reported without a pending frame.")
+                    rendered = finalize_rendered_frame(self._session, self._pending_frame_index)
+                    self._pending_frame_index = None
+                    self._render_inflight = False
+                    self._render_finished = False
+                    settings.progress_current = rendered
+                    settings.status_text = f"Rendering {rendered} / {self._session.snapshot.total_frames}"
+                    context.window_manager.progress_update(settings.progress_current)
+                    if settings.cancel_requested:
+                        self.report({"WARNING"}, "Dataset generation cancelled.")
+                        self._finish(context, cancelled=True)
+                        return {"CANCELLED"}
+                    if not has_remaining_frames(self._session):
+                        self._phase = "POINTS_PREP"
+
+                elif not self._render_inflight:
+                    if settings.cancel_requested:
+                        self.report({"WARNING"}, "Dataset generation cancelled.")
+                        self._finish(context, cancelled=True)
+                        return {"CANCELLED"}
+                    self._start_next_render(context)
 
             elif self._phase == "POINTS_PREP":
                 prepare_point_sampling(context, self._session)
@@ -118,7 +163,7 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
                 )
 
             elif self._phase == "POINTS":
-                complete = sample_point_chunk(self._session, chunk_size=self._point_chunk_size)
+                complete = self._sample_points_for_timeslice()
                 point_state = self._session.point_state
                 settings.progress_current = self._session.snapshot.total_frames + point_state.sampled_count
                 settings.status_text = (
@@ -166,6 +211,8 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
         context.window_manager.progress_end()
+        _clear_active_generator(self)
+        _remove_render_handlers()
 
         if self._session is not None:
             cleanup_dataset_build(self._session)
@@ -175,7 +222,12 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
             settings.status_text = "Cancelled"
         settings.is_running = False
         settings.cancel_requested = False
+        settings.progress_current = 0 if cancelled else settings.progress_current
         self._phase = "IDLE"
+        self._pending_frame_index = None
+        self._render_inflight = False
+        self._render_finished = False
+        self._render_cancelled = False
         self._tag_redraw(context)
 
     def _tag_redraw(self, context) -> None:
@@ -185,6 +237,49 @@ class THREE_DGS_OT_generate_dataset(bpy.types.Operator):
         for area in screen.areas:
             if area.type == "VIEW_3D":
                 area.tag_redraw()
+
+    def _start_next_render(self, context) -> None:
+        if _is_render_job_running():
+            return
+        frame_index = prepare_next_frame_render(self._session)
+        self._pending_frame_index = frame_index
+        self._render_inflight = True
+        self._render_finished = False
+        self._render_cancelled = False
+        context.scene.three_dgs_settings.status_text = (
+            f"Rendering {frame_index + 1} / {self._session.snapshot.total_frames}"
+        )
+        result = bpy.ops.render.render("INVOKE_DEFAULT", write_still=True)
+        if "CANCELLED" in result:
+            self._pending_frame_index = None
+            self._render_inflight = False
+            if _is_render_job_running():
+                return
+            raise DatasetBuildError("Failed to start the render job.")
+        if "FINISHED" in result:
+            self._render_finished = True
+
+    def _sample_points_for_timeslice(self) -> bool:
+        started_at = perf_counter()
+        complete = False
+
+        while not complete:
+            chunk_started_at = perf_counter()
+            complete = sample_point_chunk(self._session, chunk_size=self._point_chunk_size)
+            chunk_elapsed = perf_counter() - chunk_started_at
+
+            if chunk_elapsed > self._point_time_budget_seconds * 1.5:
+                self._point_chunk_size = max(self._point_chunk_min_size, self._point_chunk_size // 2)
+            elif chunk_elapsed < self._point_time_budget_seconds * 0.35:
+                self._point_chunk_size = min(self._point_chunk_max_size, self._point_chunk_size * 2)
+
+            if complete:
+                return True
+
+            if perf_counter() - started_at >= self._point_time_budget_seconds:
+                return False
+
+        return complete
 
 
 class THREE_DGS_OT_cancel_dataset_generation(bpy.types.Operator):
@@ -200,3 +295,51 @@ class THREE_DGS_OT_cancel_dataset_generation(bpy.types.Operator):
         context.scene.three_dgs_settings.cancel_requested = True
         context.scene.three_dgs_settings.status_text = "Cancelling..."
         return {"FINISHED"}
+
+
+_ACTIVE_GENERATOR: THREE_DGS_OT_generate_dataset | None = None
+
+
+def _set_active_generator(operator: THREE_DGS_OT_generate_dataset) -> None:
+    global _ACTIVE_GENERATOR
+    _ACTIVE_GENERATOR = operator
+
+
+def _clear_active_generator(operator: THREE_DGS_OT_generate_dataset) -> None:
+    global _ACTIVE_GENERATOR
+    if _ACTIVE_GENERATOR is operator:
+        _ACTIVE_GENERATOR = None
+
+
+def _ensure_render_handlers_registered() -> None:
+    if _on_render_complete not in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.append(_on_render_complete)
+    if _on_render_cancel not in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.append(_on_render_cancel)
+
+
+def _remove_render_handlers() -> None:
+    if _on_render_complete in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.remove(_on_render_complete)
+    if _on_render_cancel in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.remove(_on_render_cancel)
+
+
+def _on_render_complete(*_args) -> None:
+    if _ACTIVE_GENERATOR is None or not _ACTIVE_GENERATOR._render_inflight:
+        return
+    _ACTIVE_GENERATOR._render_finished = True
+
+
+def _on_render_cancel(*_args) -> None:
+    if _ACTIVE_GENERATOR is None or not _ACTIVE_GENERATOR._render_inflight:
+        return
+    _ACTIVE_GENERATOR._render_inflight = False
+    _ACTIVE_GENERATOR._render_cancelled = True
+
+
+def _is_render_job_running() -> bool:
+    try:
+        return bool(bpy.app.is_job_running("RENDER"))
+    except Exception:
+        return False

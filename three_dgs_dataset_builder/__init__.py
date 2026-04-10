@@ -3,7 +3,7 @@
 bl_info = {
     "name": "3DGS Dataset Builder",
     "author": "OpenAI Codex",
-    "version": (0, 3, 0),
+    "version": (0, 3, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > 3DGS Dataset",
     "description": "Generate randomized 3DGS training datasets from Blender collections.",
