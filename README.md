@@ -1,123 +1,129 @@
 # 3DGS Dataset Builder
 
-3DGS Dataset Builder is a Blender 5.x addon for exporting training datasets that can be loaded directly into Brush.
+Language: English | [日本語](README.ja.md)
 
-The current release is `v0.3.2`. The primary target is **Brush / Nerfstudio-style dataset compatibility**, not a general-purpose 3DGS exporter.
+3DGS Dataset Builder is a Blender 5.x addon that exports Brush-compatible training datasets from a Blender collection.
 
-## What It Exports
+Current release: `v0.3.3`
 
-Each dataset contains:
+## Overview
 
-* `images/*.png`
-* `transforms_train.json`
-* `transforms_test.json`
-* `points3d.ply`
-* `metadata.json`
+This addon is built for a narrow workflow:
 
-## Workflow
+* pick a collection in Blender
+* render randomized camera views around it
+* export matching camera transforms
+* export a surface-sampled `points3d.ply` for initialization
 
-The addon renders randomized camera views around a target collection and exports a surface-sampled point cloud for initialization.
+If you want a general-purpose 3DGS exporter, this project is not aiming for that. It is currently optimized for Brush / Nerfstudio-style dataset layout.
 
-Main UI fields:
+## Installation
 
-* `Save Path`
-* `Dataset Name`
-* `Include Extension`
-* `Target Collection`
-* `Focus Object`
-* `Total Frames`
-* `Min Radius` / `Max Radius`
-* `Close-up Ratio`
-* `View Distribution`
-* `Sample Count`
+1. Download `three_dgs_dataset_builder.zip` from the project's GitHub Releases.
+2. In Blender, open `Edit > Preferences > Add-ons`.
+3. Click `Install from Disk`.
+4. Select the downloaded zip file.
+5. Enable `3DGS Dataset Builder`.
 
-## Brush Compatibility
+## Where To Find The UI
 
-The current implementation is intentionally Brush-oriented.
+After enabling the addon:
 
-* `transform_matrix` is written from the Blender world matrix as-is.
-* The exporter does not pre-convert camera transforms to OpenCV format.
-* `Include Extension` must stay enabled for Brush compatibility.
-* `points3d.ply` is written into the dataset directory so Brush can find it through `ply_file_path` or same-directory lookup.
+1. Open the 3D Viewport.
+2. Open the right sidebar with `N` if it is hidden.
+3. Open the `3DGS Dataset` tab.
 
-## Material Support
+The panel path is `View3D > Sidebar > 3DGS Dataset`.
 
-Initial point colors are intentionally limited to simple, predictable cases.
+## Quick Start
 
-Works best with:
+1. Put the mesh objects you want to export into one collection.
+2. Set Blender render resolution and render engine the way you want the output images to be generated.
+3. In the addon panel, set `Save Path` and `Dataset Name`.
+4. Select `Target Collection`.
+5. Optionally select `Focus Object` if the cameras should look at a specific object instead of world origin.
+6. Adjust frame count, camera radius, and point sample count.
+7. Click `Generate Dataset`.
+8. Wait for rendering, point sampling, and final file writing to finish.
 
-* UV-unwrapped meshes
-* `Principled BSDF`
-* `Base Color` driven by a flat color or an image texture
+## UI Reference
 
-Weaker cases:
+### Dataset
 
-* complex node graphs
-* glass / transmission / reflection-heavy looks
-* procedural-texture-driven materials
-* missing UVs
+* `Save Path`: base directory where the dataset folder will be created
+* `Dataset Name`: output folder name created under `Save Path`
+* `Include Extension`: should stay enabled for Brush compatibility
 
-When image texture sampling is not available, the exporter falls back to `Base Color`. If that is not usable, it falls back to a near-white color.
+### Camera Sampling
 
-## Metadata
+* `Target Collection`: collection whose mesh objects are rendered and sampled
+* `Focus Object`: optional object the temporary camera points at; world origin is used when empty
+* `Total Frames`: number of rendered training views
+* `View Distribution`: `Full Sphere` or `Upper Hemisphere`
+* `Min Radius` / `Max Radius`: minimum and maximum camera distance from the focus point
+* `Close-up Ratio`: fraction of views biased toward the minimum radius
 
-`metadata.json` stores lightweight diagnostic information for each successful export, including:
+### Point Cloud
 
-* addon version
-* export timestamp
-* frame count
-* point sample count
-* target collection name
-* output image resolution
-* render engine
-* warning list
-* fallback material summary
+* `Sample Count`: number of surface samples written to `points3d.ply`
 
-Example shape:
+### Status And Actions
 
-```json
-{
-  "addon_version": "0.3.2",
-  "export_timestamp": "2026-04-10T12:34:56Z",
-  "dataset_name": "example",
-  "target_collection": "Collection",
-  "frame_count": 100,
-  "point_sample_count": 50000,
-  "image_resolution": {
-    "width": 1024,
-    "height": 1024
-  },
-  "render_engine": "CYCLES",
-  "warnings": [
-    {
-      "code": "material_base_color_fallback",
-      "message": "Material 'Mat_A' does not use a supported image texture chain; using base color fallback."
-    }
-  ],
-  "materials": {
-    "fallback_material_count": 1,
-    "fallback_triangle_count": 120,
-    "fallback_materials": [
-      {
-        "name": "Mat_A",
-        "triangle_count": 120
-      }
-    ]
-  }
-}
+* `Status`: shows the current phase and progress
+* `Generate Dataset`: starts export
+* `Cancel Generation`: requests cancellation after the current step finishes
+
+## Output Structure
+
+Each export creates a dataset folder at `Save Path / Dataset Name`:
+
+```text
+my_dataset/
+├── images/
+│   ├── 00000.png
+│   ├── 00001.png
+│   └── ...
+├── metadata.json
+├── points3d.ply
+├── transforms_test.json
+└── transforms_train.json
 ```
 
-## Limitations
+Notes:
 
-* This project is still optimized for Brush, not for multi-target 3DGS export.
-* Initial point color quality drops on complex materials.
-* Rendering is still dispatched one frame at a time; heavy scenes can remain slow even though the render itself now runs as a Blender job.
-* Point sampling now runs outside Blender's main UI thread, but the initial mesh and texture snapshot step can still take noticeable time on large assets.
-* `metadata.json` is written only for successful exports.
-* Fallback reporting currently stops at warning and aggregate counts, not deep node-level diagnosis.
+* `transforms_train.json` contains the rendered frames.
+* `transforms_test.json` is written with an empty `frames` array.
+* `metadata.json` is written only on successful export.
 
-## Additional Docs
+## Recommended Scene Setup
 
-* Future plans: [docs/roadmap.md](/Users/okamura-yumehiko/repository/3dgs-dataset-builder/docs/roadmap.md)
-* Release history: [docs/releases.md](/Users/okamura-yumehiko/repository/3dgs-dataset-builder/docs/releases.md)
-* Maintainer notes: [docs/development.md](/Users/okamura-yumehiko/repository/3dgs-dataset-builder/docs/development.md)
+The addon works best when:
+
+* the target collection actually contains mesh objects
+* meshes are UV-unwrapped
+* materials use `Principled BSDF`
+* `Base Color` comes from a flat color or a simple image texture
+
+Results are less predictable on complex node graphs, reflective or transmissive materials, procedural textures, or missing UVs.
+
+## Troubleshooting
+
+Common validation failures:
+
+* `Save Path is required.`
+* `Dataset Name is required.`
+* `Target Collection is required.`
+* `Target collection does not contain any mesh objects.`
+* `Brush compatibility requires Include Extension to be enabled.`
+* `Min Radius must be smaller than Max Radius.`
+
+If export feels stalled on a large asset, the slow part is often the initial render pass or the one-time point-sampling preparation step before the worker process starts reporting progress.
+
+## More Documentation
+
+* Technical background and format notes: [docs/technical-background.md](docs/technical-background.md)
+* Release history: [docs/releases.md](docs/releases.md)
+* Future plans: [docs/roadmap.md](docs/roadmap.md)
+* Maintainer notes: [docs/development.md](docs/development.md)
+
+Packaging the addon with `make package` is maintainer-facing and documented in [docs/development.md](docs/development.md).

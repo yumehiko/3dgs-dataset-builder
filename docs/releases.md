@@ -2,6 +2,21 @@
 
 This document tracks completed milestones and released behavior.
 
+## v0.3.3
+
+Theme: documentation and sampling correctness
+
+Included:
+
+* expanded the main README with clearer installation, usage, and troubleshooting guidance
+* added a Japanese README and a technical background document
+* fixed point texture sampling so edge pixels can be reached correctly
+
+Notes:
+
+* runtime behavior is unchanged from the v0.3.2 worker-based export flow
+* large assets can still pause during the one-time point-sampling snapshot step before the worker starts
+
 ## v0.3.2
 
 Theme: responsive export workflow

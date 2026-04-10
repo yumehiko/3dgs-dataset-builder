@@ -153,8 +153,8 @@ def _sample_image(image: PlainImageData, uv) -> tuple[int, int, int] | None:
 
     u = uv[0] % 1.0
     v = uv[1] % 1.0
-    x = min(width - 1, max(0, int(u * (width - 1))))
-    y = min(height - 1, max(0, int(v * (height - 1))))
+    x = min(width - 1, max(0, int(u * width)))
+    y = min(height - 1, max(0, int(v * height)))
     index = (y * width + x) * 4
     pixels = image.pixels
     return _color_to_byte_tuple((pixels[index], pixels[index + 1], pixels[index + 2]))

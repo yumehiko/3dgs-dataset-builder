@@ -31,6 +31,7 @@ gh release create <tag> dist/three_dgs_dataset_builder.zip --title <tag> --notes
 ## Documentation Split
 
 * `README.md` is user-facing
+* `docs/technical-background.md` explains runtime behavior and format details
 * `docs/roadmap.md` is future-facing only
 * `docs/releases.md` tracks completed milestones
 
